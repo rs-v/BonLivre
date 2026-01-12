@@ -40,3 +40,6 @@ Thumbs.db
 ## Misc
 /.history/
 .cache/
+
+*.epub
+*.mobi

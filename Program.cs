@@ -19,7 +19,7 @@ builder.Services.AddCors(options =>
 // 配置 JSON 选项，使用源代码生成上下文以支持 AOT
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    options.SerializerOptions.PropertyNamingPolicy = null;
+    options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
 });
 
@@ -39,17 +39,20 @@ var booksDir = Path.Combine(Directory.GetCurrentDirectory(), "books");
 if (!Directory.Exists(booksDir)) Directory.CreateDirectory(booksDir);
 
 var localFiles = Directory.GetFiles(booksDir, "*.txt");
+Console.WriteLine($"Found {localFiles.Length} local books in {booksDir}");
 foreach (var file in localFiles)
 {
     var fileName = Path.GetFileNameWithoutExtension(file);
-    bookshelf.Add(new Book(
-        fileName,
-        "本地作者",
-        $"local://{Path.GetFileName(file)}",
-        $"local://{Path.GetFileName(file)}",
-        "local",
-        "本地导入",
-        0, 0, 0));
+    var book = new Book(
+        Name: fileName,
+        Author: "本地作者",
+        BookUrl: $"local://{Path.GetFileName(file)}",
+        TocUrl: $"local://{Path.GetFileName(file)}",
+        Origin: "local",
+        OriginName: "本地导入"
+    );
+    bookshelf.Add(book);
+    Console.WriteLine($"Added book: {fileName}");
 }
 
 // --- 书架 API ---
@@ -69,7 +72,7 @@ app.MapPost("/saveReadConfig", async (HttpRequest request) =>
 // 保存书籍进度
 app.MapPost("/saveBookProgress", ([FromBody] BookProgress progress) =>
 {
-    var book = bookshelf.FirstOrDefault(b => b.name == progress.name && b.author == progress.author);
+    var book = bookshelf.FirstOrDefault(b => b.Name == progress.Name && b.Author == progress.Author);
     if (book != null)
     {
         // 演示逻辑：记录中更新建议使用数据库，这里仅返回成功
@@ -84,7 +87,7 @@ app.MapGet("/getBookshelf", () =>
 // 保存书籍
 app.MapPost("/saveBook", ([FromBody] Book book) =>
 {
-    bookshelf.RemoveAll(b => b.bookUrl == book.bookUrl);
+    bookshelf.RemoveAll(b => b.BookUrl == book.BookUrl);
     bookshelf.Add(book);
     return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
 });
@@ -92,7 +95,7 @@ app.MapPost("/saveBook", ([FromBody] Book book) =>
 // 删除书籍
 app.MapPost("/deleteBook", ([FromBody] Book book) =>
 {
-    bookshelf.RemoveAll(b => b.bookUrl == book.bookUrl);
+    bookshelf.RemoveAll(b => b.BookUrl == book.BookUrl);
     return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
 });
 
@@ -197,37 +200,58 @@ app.Run();
 // --- 模型定义 ---
 
 public record Book(
-    string name,
-    string author,
-    string bookUrl,
-    string tocUrl,
-    string origin,
-    string originName,
-    int type,
-    int durChapterIndex,
-    int durChapterPos,
-    string? coverUrl = null
+    string Name,
+    string Author,
+    string BookUrl,
+    string TocUrl,
+    string Origin,
+    string OriginName,
+    int Type = 0,
+    int Group = 0,
+    string LatestChapterTitle = "未更新",
+    long LatestChapterTime = 0,
+    long LastCheckTime = 0,
+    int LastCheckCount = 0,
+    int TotalChapterNum = 0,
+    string DurChapterTitle = "未阅读",
+    int DurChapterIndex = 0,
+    int DurChapterPos = 0,
+    long DurChapterTime = 0,
+    bool CanUpdate = true,
+    int Order = 0,
+    int OriginOrder = 0,
+    long SyncTime = 0,
+    string? CoverUrl = null,
+    string? Intro = ""
 );
 
 public record BookProgress(
-    string name,
-    string author,
-    int durChapterIndex,
-    int durChapterPos,
-    long durChapterTime,
-    string durChapterTitle
+    string Name,
+    string Author,
+    int DurChapterIndex,
+    int DurChapterPos,
+    long DurChapterTime,
+    string DurChapterTitle
 );
 
 public record BookChapter(
-    string title,
-    string url,
-    int index
+    string Title,
+    string Url,
+    int Index,
+    bool IsVolume = false,
+    string BaseUrl = "",
+    string BookUrl = "",
+    bool IsVip = false,
+    bool IsPay = false
 );
 
 // API 响应包装类
-public record LeagdoApiResponse<T>(bool isSuccess, string errorMsg, T data);
+public record LeagdoApiResponse<T>(bool IsSuccess, string ErrorMsg, T Data);
 
 // --- JSON 源代码生成上下文 ---
+[JsonSourceGenerationOptions(
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(Book))]
 [JsonSerializable(typeof(BookProgress))]
 [JsonSerializable(typeof(BookChapter))]
