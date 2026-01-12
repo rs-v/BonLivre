@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using BonLivre.Models;
 using BonLivre.Services;
@@ -14,6 +15,7 @@ public static class BookshelfEndpoints
     {
         var localService = new LocalBookService();
         _bookshelf = localService.GetLocalBooks();
+        var progressStore = new BookProgressStore();
 
         app.MapGet("/getReadConfig", () =>
             Results.Json(new LeagdoApiResponse<string>(true, "", _readConfig), AppJsonSerializerContext.Default.LeagdoApiResponseString));
@@ -27,12 +29,62 @@ public static class BookshelfEndpoints
 
         app.MapPost("/saveBookProgress", async (HttpRequest request) =>
         {
-            // For now just return success to stop the errors, as it's not critical for the POC
-            return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            try
+            {
+                var progress = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.BookProgress,
+                    request.HttpContext.RequestAborted);
+
+                if (progress == null)
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<string>(false, "缺少书籍进度数据", ""),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+
+                progressStore.Save(progress);
+                return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<string>(false, "请求已取消", ""),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[saveBookProgress Error]: {ex}");
+                return Results.Json(
+                    new LeagdoApiResponse<string>(false, "保存进度失败", ""),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
         });
 
         app.MapGet("/getBookshelf", () =>
-            Results.Json(new LeagdoApiResponse<List<Book>>(true, "", _bookshelf), AppJsonSerializerContext.Default.LeagdoApiResponseListBook));
+        {
+            var books = localService.GetLocalBooks();
+            var allProgress = progressStore.GetAllProgress();
+
+            var mergedBooks = books.Select(book =>
+            {
+                var progress = allProgress.FirstOrDefault(p => p.Name == book.Name && p.Author == book.Author);
+                if (progress != null)
+                {
+                    return book with
+                    {
+                        DurChapterIndex = progress.DurChapterIndex,
+                        DurChapterPos = progress.DurChapterPos,
+                        DurChapterTime = progress.DurChapterTime,
+                        DurChapterTitle = progress.DurChapterTitle
+                    };
+                }
+                return book;
+            }).ToList();
+
+            _bookshelf = mergedBooks;
+            return Results.Json(new LeagdoApiResponse<List<Book>>(true, "", _bookshelf), AppJsonSerializerContext.Default.LeagdoApiResponseListBook);
+        });
 
         app.MapPost("/saveBook", async (HttpRequest request) =>
         {

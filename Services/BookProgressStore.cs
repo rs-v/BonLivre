@@ -58,4 +58,27 @@ ON CONFLICT(Name, Author) DO UPDATE SET
         command.Parameters.AddWithValue("$title", progress.DurChapterTitle);
         command.ExecuteNonQuery();
     }
+
+    public List<BookProgress> GetAllProgress()
+    {
+        var result = new List<BookProgress>();
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Name, Author, DurChapterIndex, DurChapterPos, DurChapterTime, DurChapterTitle FROM BookProgress";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            result.Add(new BookProgress(
+                Name: reader.GetString(0),
+                Author: reader.GetString(1),
+                DurChapterIndex: reader.GetInt32(2),
+                DurChapterPos: reader.GetInt32(3),
+                DurChapterTime: reader.GetInt64(4),
+                DurChapterTitle: reader.GetString(5)
+            ));
+        }
+        return result;
+    }
 }
+
