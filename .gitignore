@@ -1,0 +1,42 @@
+## Visual Studio / .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+*.userosscache
+
+## NuGet
+packages/
+*.nupkg
+.nuget/
+
+## Build output
+artifacts/
+publish/
+
+## Node / Vite
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+
+## Logs
+*.log
+
+## Environment
+.env
+.env.*
+
+## OS files
+.DS_Store
+Thumbs.db
+
+## Misc
+/.history/
+.cache/
