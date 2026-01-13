@@ -43,3 +43,7 @@ Thumbs.db
 
 *.epub
 *.mobi
+
+## Local Data
+data/
+*.sqlite
