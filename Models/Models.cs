@@ -50,3 +50,20 @@ public record BookChapter(
 
 // API 响应包装类
 public record LeagdoApiResponse<T>(bool IsSuccess, string ErrorMsg, T Data);
+
+public record SearchRequest(string Key);
+
+public record SearchBook(
+    string Name,
+    string Author,
+    string BookUrl,
+    string Origin,
+    string OriginName,
+    int Type = 0,
+    string? TocUrl = null,
+    long Time = 0,
+    int OriginOrder = 0,
+    string? CoverUrl = null,
+    string? Intro = "",
+    string? LatestChapterTitle = ""
+);
