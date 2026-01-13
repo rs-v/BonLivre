@@ -27,7 +27,8 @@ jobs:
       run: dotnet build BonLiver.sln --no-restore --configuration Release
       
     - name: Check format
-      run: dotnet format --verify-no-changes --no-restore || true
+      run: dotnet format --verify-no-changes --no-restore
+      continue-on-error: true
 
   frontend:
     name: Frontend Build and Check
@@ -57,7 +58,7 @@ jobs:
       
     - name: Lint
       working-directory: ./web
-      run: pnpm run lint:fix
+      run: npx eslint .
       continue-on-error: true
       
     - name: Build
