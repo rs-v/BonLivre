@@ -32,6 +32,16 @@ jobs:
     - name: Check format
       run: dotnet format --verify-no-changes --no-restore
       continue-on-error: true
+      
+    - name: Publish
+      run: dotnet publish BonLivre.csproj --no-restore --configuration Release --output ./publish
+      
+    - name: Upload backend artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: backend-build
+        path: ./publish
+        retention-days: 7
 
   frontend:
     name: Frontend Build and Check
@@ -67,6 +77,13 @@ jobs:
     - name: Build
       working-directory: ./web
       run: pnpm run build
+      
+    - name: Upload frontend artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-build
+        path: ./web/dist
+        retention-days: 7
 
   build-success:
     name: All Checks Passed
