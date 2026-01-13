@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend Build and Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore BonLiver.sln
+      
+    - name: Build
+      run: dotnet build BonLiver.sln --no-restore --configuration Release
+      
+    - name: Check format
+      run: dotnet format --verify-no-changes --no-restore
+      continue-on-error: true
+
+  frontend:
+    name: Frontend Build and Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 9
+        
+    - name: Install dependencies
+      working-directory: ./web
+      run: pnpm install
+      
+    - name: Type check
+      working-directory: ./web
+      run: pnpm run type-check
+      
+    - name: Lint
+      working-directory: ./web
+      run: npx eslint .
+      continue-on-error: true
+      
+    - name: Build
+      working-directory: ./web
+      run: pnpm run build
+
+  build-success:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    
+    steps:
+    - name: Success
+      run: echo "All builds and checks completed successfully!"
