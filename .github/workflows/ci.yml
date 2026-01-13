@@ -34,7 +34,7 @@ jobs:
       continue-on-error: true
       
     - name: Publish
-      run: dotnet publish BonLivre.csproj --no-restore --configuration Release --output ./publish
+      run: dotnet publish BonLivre.csproj --configuration Release --output ./publish --runtime linux-x64 --self-contained
       
     - name: Upload backend artifact
       uses: actions/upload-artifact@v4
