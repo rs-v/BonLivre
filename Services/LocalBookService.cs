@@ -10,11 +10,17 @@ namespace BonLivre.Services;
 public class LocalBookService
 {
     private readonly string _booksDir;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, EpubBook> _epubCache = new();
 
     public LocalBookService()
     {
         _booksDir = Path.Combine(Directory.GetCurrentDirectory(), "books");
         if (!Directory.Exists(_booksDir)) Directory.CreateDirectory(_booksDir);
+    }
+
+    private EpubBook GetOrAddEpub(string filePath)
+    {
+        return _epubCache.GetOrAdd(filePath, (path) => EpubReader.ReadBook(path));
     }
 
     public List<Book> GetLocalBooks()
@@ -53,7 +59,7 @@ public class LocalBookService
             var epubChapters = new List<BookChapter>();
             try
             {
-                EpubBook book = EpubReader.ReadBook(filePath);
+                EpubBook book = GetOrAddEpub(filePath);
                 int idx = 0;
                 foreach (var textFile in book.ReadingOrder)
                 {
@@ -102,7 +108,7 @@ public class LocalBookService
                 var epubParts = url.Split("#epub#", StringSplitOptions.RemoveEmptyEntries);
                 string? targetFile = epubParts.Length > 1 ? epubParts[1] : null;
 
-                EpubBook book = EpubReader.ReadBook(filePath);
+                EpubBook book = GetOrAddEpub(filePath);
                 string? htmlContent = null;
                 if (targetFile != null)
                 {
@@ -211,62 +217,109 @@ public class LocalBookService
         try
         {
             var fileName = bookUrl.Replace("local://", "");
+            fileName = System.Net.WebUtility.UrlDecode(fileName);
             var filePath = Path.Combine(_booksDir, fileName);
-            if (!File.Exists(filePath)) return null;
 
-            // 使用 ReadBook 会读取所有文件结构到内存，适合随机查询资源
-            EpubBook book = EpubReader.ReadBook(filePath);
-            var normalizedPath = resourcePath.Replace("\\", "/").TrimStart('/');
-
-            // 搜索所有本地资源 (Images, Fonts, Html, Css 等)
-            var allFiles = book.Content.AllFiles.Local;
-
-            // 匹配策略：
-            // 1. 完全一致
-            // 2. 结尾匹配且前面有斜杠 (防止 images/001.jpg 匹配了 other_images/001.jpg)
-            // 3. 文件名直接匹配 (最后手段)
-            var match = allFiles.FirstOrDefault(f =>
+            if (!File.Exists(filePath))
             {
-                var fPath = f.FilePath.Replace("\\", "/");
-                return fPath.Equals(normalizedPath, StringComparison.OrdinalIgnoreCase) ||
-                       fPath.EndsWith("/" + normalizedPath, StringComparison.OrdinalIgnoreCase) ||
-                       fPath.Equals(normalizedPath.Split('/').Last(), StringComparison.OrdinalIgnoreCase);
-            });
-
-            if (match != null)
-            {
-                if (match is EpubLocalByteContentFile byteFile)
-                {
-                    if (byteFile.Content == null || byteFile.Content.Length == 0)
-                    {
-                        Console.WriteLine($"[EPUB Resource Warning] Content empty: url={bookUrl} path={resourcePath} normalized={normalizedPath} real={byteFile.FilePath}");
-                        return null;
-                    }
-                    return (byteFile.Content, byteFile.ContentMimeType ?? "image/jpeg");
-                }
-
-                if (match is EpubLocalTextContentFile textFile)
-                {
-                    if (string.IsNullOrEmpty(textFile.Content))
-                    {
-                        Console.WriteLine($"[EPUB Resource Warning] Text content empty: url={bookUrl} path={resourcePath} normalized={normalizedPath} real={textFile.FilePath}");
-                        return null;
-                    }
-                    return (Encoding.UTF8.GetBytes(textFile.Content), textFile.ContentMimeType ?? "text/plain");
-                }
-
-                Console.WriteLine($"[EPUB Resource Warning] Unknown match type: {match.GetType().Name} for path={resourcePath} normalized={normalizedPath}");
+                Console.WriteLine($"[EPUB Resource] File not found: {filePath}");
+                return null;
             }
-            else
+
+            EpubBook book = GetOrAddEpub(filePath);
+
+            // 规范化目标路径
+            var targetPath = System.Net.WebUtility.UrlDecode(resourcePath).Replace("\\", "/").Trim().TrimStart('/');
+            // 处理路径中的 ../
+            if (targetPath.Contains("../"))
             {
-                Console.WriteLine($"[EPUB Resource Miss] url={bookUrl} path={resourcePath} normalized={normalizedPath}");
+                var parts = targetPath.Split('/');
+                var stack = new Stack<string>();
+                foreach (var part in parts)
+                {
+                    if (part == "..") { if (stack.Count > 0) stack.Pop(); }
+                    else if (part != "." && !string.IsNullOrEmpty(part)) stack.Push(part);
+                }
+                var resolvedParts = stack.ToArray();
+                Array.Reverse(resolvedParts);
+                targetPath = string.Join("/", resolvedParts);
+            }
+            var targetFileName = Path.GetFileName(targetPath);
+
+            // 1. 优先从图片目录查找 (VersOne.Epub 自动提取的图片资源)
+            if (book.Content?.Images?.Local != null)
+            {
+                var imageMatch = book.Content.Images.Local.FirstOrDefault(f =>
+                {
+                    if (string.IsNullOrEmpty(f.FilePath)) return false;
+                    var fPath = f.FilePath.Replace("\\", "/").Trim().TrimStart('/');
+                    // 匹配逻辑：全匹配、后缀匹配、包含匹配、文件名匹配
+                    return fPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase) ||
+                           fPath.EndsWith("/" + targetPath, StringComparison.OrdinalIgnoreCase) ||
+                           targetPath.EndsWith("/" + fPath, StringComparison.OrdinalIgnoreCase) ||
+                           Path.GetFileName(fPath).Equals(targetFileName, StringComparison.OrdinalIgnoreCase);
+                });
+
+                if (imageMatch != null && imageMatch.Content != null)
+                {
+                    return (imageMatch.Content, imageMatch.ContentMimeType ?? GetMimeType(targetFileName));
+                }
+            }
+
+            // 2. 备选方案：从所有本地文件查找 (处理一些未标注为 Image 的资源)
+            var allFiles = book.Content?.AllFiles?.Local;
+            if (allFiles != null)
+            {
+                var match = allFiles.FirstOrDefault(f =>
+                {
+                    if (string.IsNullOrEmpty(f.FilePath)) return false;
+                    var fPath = f.FilePath.Replace("\\", "/").Trim().TrimStart('/');
+                    return fPath.Equals(targetPath, StringComparison.OrdinalIgnoreCase) ||
+                           fPath.EndsWith("/" + targetPath, StringComparison.OrdinalIgnoreCase) ||
+                           targetPath.EndsWith("/" + fPath, StringComparison.OrdinalIgnoreCase) ||
+                           Path.GetFileName(fPath).Equals(targetFileName, StringComparison.OrdinalIgnoreCase);
+                });
+
+                if (match != null)
+                {
+                    if (match is EpubLocalByteContentFile byteFile && byteFile.Content != null)
+                    {
+                        return (byteFile.Content, byteFile.ContentMimeType ?? GetMimeType(targetFileName));
+                    }
+
+                    if (match is EpubLocalTextContentFile textFile && !string.IsNullOrEmpty(textFile.Content))
+                    {
+                        return (Encoding.UTF8.GetBytes(textFile.Content), textFile.ContentMimeType ?? "text/plain");
+                    }
+                }
+            }
+
+            Console.WriteLine($"[EPUB Resource Miss] Target: {targetPath}, FileName: {targetFileName}");
+            if (allFiles != null)
+            {
+                var samples = allFiles.Take(10).Select(f => f.FilePath).ToList();
+                Console.WriteLine($"[EPUB Resource Debug] Available files (sample): {string.Join(", ", samples)}");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[EPUB Resource Error]: url={bookUrl} path={resourcePath} message={ex}");
+            Console.WriteLine($"[EPUB Resource Exception] url={bookUrl} path={resourcePath} ex={ex}");
         }
         return null;
+    }
+
+    private string GetMimeType(string fileName)
+    {
+        var ext = Path.GetExtension(fileName).ToLower();
+        return ext switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png" => "image/png",
+            ".gif" => "image/gif",
+            ".webp" => "image/webp",
+            ".svg" => "image/svg+xml",
+            _ => "application/octet-stream"
+        };
     }
 
     public byte[]? GetEpubCover(string path)
@@ -277,7 +330,7 @@ public class LocalBookService
         {
             try
             {
-                EpubBook book = EpubReader.ReadBook(filePath);
+                EpubBook book = GetOrAddEpub(filePath);
                 return book.CoverImage;
             }
             catch { }

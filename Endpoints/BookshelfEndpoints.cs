@@ -155,14 +155,17 @@ public static class BookshelfEndpoints
             return Results.Redirect(path);
         });
 
-        app.MapGet("/image", (string url, string path) =>
+        app.MapGet("/image", (string url, string path, int? width) =>
         {
             try
             {
+                if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(path))
+                    return Results.BadRequest("Missing url or path");
+
                 if (url.StartsWith("local://") && url.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
                 {
                     var resource = localService.GetEpubResource(url, path);
-                    if (resource != null)
+                    if (resource != null && resource.Value.Content != null)
                     {
                         return Results.File(resource.Value.Content, resource.Value.MimeType);
                     }
@@ -171,8 +174,13 @@ public static class BookshelfEndpoints
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Image EndPoint Error]: {ex}");
-                return Results.Problem(ex.Message);
+                Console.WriteLine($"[Image EndPoint Critical Error]: url={url}, path={path}\n{ex}");
+                // 暂时返回详细信息以供调试
+                return Results.Problem(
+                    detail: ex.ToString(),
+                    statusCode: 500,
+                    title: "EPUB Image Resource Error"
+                );
             }
         });
     }
