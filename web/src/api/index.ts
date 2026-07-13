@@ -6,7 +6,7 @@ import API, {
   legado_http_entry_point,
   setWebsocketOnMessage,
 } from './api'
-import ajax from './axios'
+import ajax, { getAuthPassword } from './axios'
 import { validatorHttpUrl } from '@/utils/utils'
 
 import { createApp } from 'vue'
@@ -49,18 +49,41 @@ const responseCheckInterceptor = (resp: AxiosResponse) => {
 }
 
 const axiosErrorInterceptor = (err: unknown) => {
-  notification.error({
-    message: '后端连接失败，请检查阅读WEB服务或者设置其它可用链接',
-    grouping: true,
-  })
-  connectionStore.setConnectType('danger')
-  connectionStore.setConnectStatus('连接异常')
+  // 区分 401（密码错误或未授权）与一般连接失败
+  const status = (err as { response?: { status?: number } })?.response?.status
+  if (status === 401) {
+    notification.error({
+      message: '未授权：后端密码错误或未设置，请在「连接」中填写正确密码',
+      grouping: true,
+    })
+    connectionStore.setConnectType('danger')
+    connectionStore.setConnectStatus('未授权')
+  } else {
+    notification.error({
+      message: '后端连接失败，请检查阅读WEB服务或者设置其它可用链接',
+      grouping: true,
+    })
+    connectionStore.setConnectType('danger')
+    connectionStore.setConnectStatus('连接异常')
+  }
   throw err
 }
 // http全局
 ajax.interceptors.response.use(responseCheckInterceptor, axiosErrorInterceptor)
 // websocket
-setWebsocketOnError(axiosErrorInterceptor)
+// 浏览器出于安全不向 JS 暴露 WebSocket 握手的 HTTP 状态码（如 401），
+// error 事件也没有 .response，因此无法像 HTTP 那样精确区分 401。
+// 这里单独处理：已设置密码时，握手失败很可能是密码错误，给出针对性提示。
+const websocketOnError: typeof WebSocket.prototype.onerror = event => {
+  const message = getAuthPassword()
+    ? '连接异常：可能是后端密码错误，或阅读WEB服务不可用'
+    : '后端连接失败，请检查阅读WEB服务或者设置其它可用链接'
+  notification.error({ message, grouping: true })
+  connectionStore.setConnectType('danger')
+  connectionStore.setConnectStatus('连接异常')
+  return event
+}
+setWebsocketOnError(websocketOnError)
 setWebsocketOnMessage(() => {
   connectionStore.setConnectType('primary')
   connectionStore.setConnectStatus('已连接 ' + legado_http_entry_point)

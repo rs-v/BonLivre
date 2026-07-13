@@ -6,6 +6,12 @@
     <Nullable>enable</Nullable>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!--
+      web/ 是前端源码目录。Web SDK 默认会把项目下的 **/*.json、**/*.ts 等当作
+      Content 打进产物，导致 web/package.json、tsconfig*.json 混入发布目录。
+      整个排除 web/，前端产物由下方 target 显式注入。
+    -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);web\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,5 +19,28 @@
     <PackageReference Include="VersOne.Epub" Version="3.3.4" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
   </ItemGroup>
+
+  <!--
+    发布时自动构建前端并打包进产物的 wwwroot/。一条 dotnet publish 即可产出
+    「原生 exe + wwwroot/」。只调后端时用 -p:SkipFrontend=true 跳过前端构建。
+
+    实现要点：wwwroot/**  的静态资源 glob 发生在 MSBuild 求值期（任何 target 运行前），
+    那时前端还没构建，无法依赖它。因此这里 hook 到 ComputeFilesToPublish 之前，
+    先构建前端，再把 web/dist/** 直接作为 ResolvedFileToPublish 注入发布文件列表，
+    目标相对路径设为 wwwroot/…，绕开求值期 glob 的时序问题。
+  -->
+  <Target Name="BuildFrontend"
+          BeforeTargets="ComputeFilesToPublish"
+          Condition="'$(SkipFrontend)' != 'true'">
+    <Exec Command="pnpm install --frozen-lockfile" WorkingDirectory="web" />
+    <Exec Command="pnpm build" WorkingDirectory="web" />
+    <ItemGroup>
+      <_FrontendDist Include="web\dist\**\*" />
+      <ResolvedFileToPublish Include="@(_FrontendDist)">
+        <RelativePath>wwwroot\%(_FrontendDist.RecursiveDir)%(_FrontendDist.Filename)%(_FrontendDist.Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 
 </Project>

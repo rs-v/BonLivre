@@ -2,7 +2,7 @@
 /** https://github.com/gedoor/legado/tree/master/app/src/main/java/io/legado/app/web */
 
 import type { webReadConfig } from '@/web'
-import ajax from './axios'
+import ajax, { getAuthPassword } from './axios'
 import type {
   BaseBook,
   Book,
@@ -39,6 +39,17 @@ export const setApiEntryPoint = (
   ajax.defaults.baseURL = legado_http_entry_point
 }
 
+/**
+ * 为无法设置请求头的 URL（WebSocket、<img src>、sendBeacon）追加 ?password= query。
+ * HTTP 请求走 Authorization header，无需调用此函数。密码未设置时原样返回。
+ */
+const withPassword = (url: string | URL): URL => {
+  const u = new URL(url)
+  const password = getAuthPassword()
+  if (password) u.searchParams.set('password', password)
+  return u
+}
+
 // 书架API
 // Http
 const getReadConfig = async (http_url = legado_http_entry_point) => {
@@ -64,7 +75,7 @@ const saveBookProgressWithBeacon = (bookProgress: BookProgress) => {
   if (!bookProgress) return
   // 常规请求可能会被取消 使用Fetch keep-alive 或者 navigator.sendBeacon
   navigator.sendBeacon(
-    new URL('saveBookProgress', legado_http_entry_point),
+    withPassword(new URL('saveBookProgress', legado_http_entry_point)),
     JSON.stringify(bookProgress),
   )
 }
@@ -94,7 +105,7 @@ const search = (
   onFinish: () => void,
 ) => {
   const socket = new WebSocket(
-    new URL('searchBook', legado_webSocket_entry_point),
+    withPassword(new URL('searchBook', legado_webSocket_entry_point)),
   )
   socket.onerror = wsOnError
 
@@ -154,7 +165,7 @@ const debug = (
     legado_webSocket_entry_point,
   )
 
-  const socket = new WebSocket(url)
+  const socket = new WebSocket(withPassword(url))
   socket.onerror = wsOnError
   socket.onopen = () => {
     socket.send(JSON.stringify({ tag: sourceUrl, key: searchKey }))
@@ -174,10 +185,13 @@ const debug = (
  * @param {string} coverUrl
  */
 const getProxyCoverUrl = (coverUrl: string) => {
-  if (coverUrl.startsWith(legado_http_entry_point)) return coverUrl
-  return new URL(
-    'cover?path=' + encodeURIComponent(coverUrl),
-    legado_http_entry_point,
+  if (coverUrl.startsWith(legado_http_entry_point))
+    return withPassword(coverUrl).toString()
+  return withPassword(
+    new URL(
+      'cover?path=' + encodeURIComponent(coverUrl),
+      legado_http_entry_point,
+    ),
   ).toString()
 }
 /**
@@ -191,15 +205,17 @@ const getProxyImageUrl = (
   src: string,
   width: number | `${number}`,
 ) => {
-  if (src.startsWith(legado_http_entry_point)) return src
-  return new URL(
-    'image?path=' +
-      encodeURIComponent(src) +
-      '&url=' +
-      encodeURIComponent(bookUrl) +
-      '&width=' +
-      width,
-    legado_http_entry_point,
+  if (src.startsWith(legado_http_entry_point)) return withPassword(src).toString()
+  return withPassword(
+    new URL(
+      'image?path=' +
+        encodeURIComponent(src) +
+        '&url=' +
+        encodeURIComponent(bookUrl) +
+        '&width=' +
+        width,
+      legado_http_entry_point,
+    ),
   ).toString()
 }
 

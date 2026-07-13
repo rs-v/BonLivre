@@ -17,6 +17,9 @@ packages/
 artifacts/
 publish/
 
+## 前端构建产物（由 BonLivre.csproj 的 BuildFrontend target 在 publish 时生成）
+wwwroot/
+
 ## Node / Vite
 node_modules/
 dist/

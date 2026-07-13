@@ -75,6 +75,41 @@
         :isSearch="isSearching"
       ></book-items>
     </div>
+
+    <el-dialog
+      v-model="connectDialogVisible"
+      title="连接后端"
+      width="90%"
+      style="max-width: 420px"
+    >
+      <el-form label-position="top" @submit.prevent>
+        <el-form-item label="后端地址">
+          <el-input
+            v-model="connectForm.url"
+            placeholder="如：http://127.0.0.1:5000"
+            :disabled="connectLoading"
+          />
+        </el-form-item>
+        <el-form-item label="访问密码（未设置密码可留空）">
+          <el-input
+            v-model="connectForm.password"
+            type="password"
+            show-password
+            placeholder="后端未设置密码时留空"
+            :disabled="connectLoading"
+            @keyup.enter="submitConnect"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="connectDialogVisible = false" :disabled="connectLoading"
+          >取消</el-button
+        >
+        <el-button type="primary" :loading="connectLoading" @click="submitConnect"
+          >{{ connectLoading ? '校验中…' : '确定' }}</el-button
+        >
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -85,7 +120,11 @@ import { useBookStore } from '@/store'
 import githubUrl from '@/assets/imgs/github.png'
 import { useLoading } from '@/hooks/loading'
 import { Search as SearchIcon } from '@element-plus/icons-vue'
-import { baseURL_localStorage_key } from '@/api/axios'
+import {
+  baseURL_localStorage_key,
+  setAuthPassword,
+  getAuthPassword,
+} from '@/api/axios'
 import API, {
   legado_http_entry_point,
   parseLeagdoHttpUrlWithDefault,
@@ -178,50 +217,61 @@ const searchBook = () => {
 const connectionStore = useConnectionStore()
 const { connectStatus, connectType, newConnect } = storeToRefs(connectionStore)
 
+// 连接对话框：地址 + 密码双输入框
+const connectDialogVisible = ref(false)
+const connectLoading = ref(false)
+const connectForm = reactive({
+  url: '',
+  password: '',
+})
+
 const setLegadoRetmoteUrl = () => {
-  ElMessageBox.prompt(
-    '请输入 后端地址 ( 如：http://127.0.0.1:9527 或者通过内网穿透的地址)',
-    '提示',
-    {
-      confirmButtonText: '确定',
-      cancelButtonText: '取消',
-      inputPlaceholder: legado_http_entry_point,
-      inputValidator: value => validatorHttpUrl(value),
-      inputErrorMessage: '输入的格式不对',
-      beforeClose: (action, instance, done) => {
-        if (action === 'confirm') {
-          connectionStore.setNewConnect(true)
-          instance.confirmButtonLoading = true
-          instance.confirmButtonText = '校验中……'
-          // instance.inputValue
-          const url = new URL(instance.inputValue).toString()
-          API.getReadConfig(url)
-            .then(function (config) {
-              connectionStore.setNewConnect(false)
-              applyReadConfig(config)
-              instance.confirmButtonLoading = false
-              store.clearSearchBooks()
-              setApiEntryPoint(...parseLeagdoHttpUrlWithDefault(url))
-              if (url === location.origin) {
-                localStorage.removeItem(baseURL_localStorage_key)
-              } else {
-                localStorage.setItem(baseURL_localStorage_key, url)
-              }
-              store.loadBookShelf()
-              done()
-            })
-            .catch(function (error) {
-              connectionStore.setNewConnect(false)
-              instance.confirmButtonLoading = false
-              instance.confirmButtonText = '确定'
-              throw error
-            })
-        } else {
-          done()
-        }
-      },
-    },
-  )
+  // 预填当前地址与已保存密码
+  connectForm.url = legado_http_entry_point || location.origin
+  connectForm.password = getAuthPassword()
+  connectDialogVisible.value = true
+}
+
+const submitConnect = async () => {
+  const rawUrl = connectForm.url.trim()
+  if (!validatorHttpUrl(rawUrl)) {
+    ElMessage.error('后端地址格式不正确')
+    return
+  }
+  const url = new URL(rawUrl).toString()
+
+  connectLoading.value = true
+  connectionStore.setNewConnect(true)
+  // 校验前保存旧密码，失败时回滚，避免错误密码覆盖并锁死后续请求
+  const previousPassword = getAuthPassword()
+  // 先应用密码，使校验请求即带凭证
+  setAuthPassword(connectForm.password.trim())
+
+  try {
+    const config = await API.getReadConfig(url)
+    connectionStore.setNewConnect(false)
+    applyReadConfig(config)
+    store.clearSearchBooks()
+    setApiEntryPoint(...parseLeagdoHttpUrlWithDefault(url))
+    // location.origin 无尾斜杠，而 new URL().toString() 必带；归一化后再比较
+    if (url === new URL(location.origin).toString()) {
+      localStorage.removeItem(baseURL_localStorage_key)
+    } else {
+      localStorage.setItem(baseURL_localStorage_key, url)
+    }
+    store.loadBookShelf()
+    connectDialogVisible.value = false
+    ElMessage.success('连接成功')
+  } catch (error) {
+    connectionStore.setNewConnect(false)
+    // 校验失败，回滚密码，防止错误密码残留导致刷新后被 401 锁死
+    setAuthPassword(previousPassword)
+    // 401 已由 axios 拦截器提示密码错误，这里兜底提示
+    ElMessage.error('连接失败，请检查地址与密码')
+    throw error
+  } finally {
+    connectLoading.value = false
+  }
 }
 
 const router = useRouter()

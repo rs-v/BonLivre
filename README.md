@@ -114,6 +114,31 @@ BonLivre/
 3. **Book Source Editor**: Access `http://localhost:8080/#/bookSource` for book source editing
 4. **RSS Source Editor**: Access `http://localhost:8080/#/rssSource` for RSS source editing
 
+### 🔐 Authentication (Optional)
+
+BonLivre supports an optional single shared password to protect backend access. It is disabled by default (open mode) for backward compatibility.
+
+To enable it, set the `BONLIVRE_PASSWORD` environment variable before starting the backend:
+
+```bash
+# Linux / macOS
+BONLIVRE_PASSWORD=your-password dotnet run
+
+# Windows (PowerShell)
+$env:BONLIVRE_PASSWORD="your-password"; dotnet run
+```
+
+When a password is set, all API and WebSocket requests require it. Static frontend files and the root health-check path remain unprotected so the page can load. In the web interface, open the **连接 (Connect)** dialog and enter the address and password.
+
+How the credential is transmitted:
+- HTTP requests carry it via the `Authorization: Bearer <password>` header.
+- WebSocket, image (`<img src>`), and `sendBeacon` requests carry it via a `?password=` query parameter, since browsers cannot set custom headers on those.
+
+⚠️ **Security notes:**
+- Without HTTPS, the password is transmitted in plaintext. Use only on a trusted LAN, or put the backend behind HTTPS / an encrypted tunnel.
+- The query-parameter credential may appear in reverse-proxy or access logs.
+- There is no login rate limiting or lockout. This is intended for LAN/personal use, not public exposure.
+
 ### 🔌 API Endpoints
 
 #### Bookshelf Endpoints
@@ -142,9 +167,9 @@ Build the project:
 dotnet build
 ```
 
-Publish for production:
+Publish for production (see [Deployment](#deployment) for details):
 ```bash
-dotnet publish -c Release
+dotnet publish -c Release -r win-x64
 ```
 
 #### Frontend Development
@@ -169,6 +194,39 @@ Format code:
 ```bash
 pnpm format
 ```
+
+<a name="deployment"></a>
+### 📦 Deployment
+
+The backend serves the frontend as static files, so a single Native AOT executable is all you need to run in production — no separate web server for the UI.
+
+Publishing builds the frontend and bundles it automatically. The `BuildFrontend` MSBuild target (in `BonLivre.csproj`) runs `pnpm install` + `pnpm build` and copies `web/dist/` into `wwwroot/` before publish, so one command produces a self-contained executable plus its `wwwroot/`:
+
+```bash
+dotnet publish -c Release -r win-x64      # Windows x64
+dotnet publish -c Release -r linux-x64    # Linux x64
+dotnet publish -c Release -r linux-arm64  # ARM (e.g. Raspberry Pi)
+```
+
+The output is in `bin/Release/net10.0/<RID>/publish/`. Because Native AOT compiles to native machine code, the executable is platform-specific: build on (or for) the same OS/architecture you deploy to. The `pnpm` toolchain (Node >= 20, pnpm >= 9) must be available on the build machine, and a native C/C++ toolchain is required for the AOT step (MSVC + Windows SDK on Windows, clang/build-essential on Linux).
+
+> **Windows:** the AOT link step invokes MSVC's `link.exe` and locates it via `vswhere.exe`. If publishing fails with `'vswhere.exe' is not recognized` or `link.exe ... exited with code 123`, the toolchain is not on `PATH`. Either run the publish command from the **"x64 Native Tools Command Prompt for VS 2022"** (which sets up the MSVC environment), or install the **"Desktop development with C++"** workload (MSVC v143 + Windows SDK) via the Visual Studio Installer. Skip the AOT step entirely with `-p:PublishAot=false` if you only need a framework-dependent build.
+
+To publish the backend only and skip the frontend build (e.g. when iterating on the API):
+
+```bash
+dotnet publish -c Release -r win-x64 -p:SkipFrontend=true
+```
+
+Running the published app:
+
+```bash
+cd bin/Release/net10.0/win-x64/publish
+./BonLivre                                        # open mode
+BONLIVRE_PASSWORD=your-password ./BonLivre        # with authentication
+```
+
+It listens on `http://0.0.0.0:5000` and `:5001`. Open `http://<host>:5000/` in a browser — the frontend is served from the same origin, so no separate backend address needs to be configured. Static assets are cached with content-hash `immutable` headers while `index.html` is served `no-cache`, so redeploys take effect immediately.
 
 ### 🌐 Browser Compatibility
 
@@ -298,6 +356,31 @@ BonLivre/
 3. **书源编辑**：访问 `http://localhost:8080/#/bookSource` 进行书源编辑
 4. **订阅源编辑**：访问 `http://localhost:8080/#/rssSource` 进行订阅源编辑
 
+### 🔐 认证（可选）
+
+BonLivre 支持可选的单一共享密码来保护后端访问。默认关闭（开放模式），以保持向后兼容。
+
+启用方式：启动后端前设置环境变量 `BONLIVRE_PASSWORD`：
+
+```bash
+# Linux / macOS
+BONLIVRE_PASSWORD=你的密码 dotnet run
+
+# Windows (PowerShell)
+$env:BONLIVRE_PASSWORD="你的密码"; dotnet run
+```
+
+设置密码后，所有 API 和 WebSocket 请求都需要携带密码。静态前端文件和根路径存活探测不受保护，以保证页面能正常加载。在 Web 界面点击**连接**对话框，填入地址和密码即可。
+
+凭证传递方式：
+- HTTP 请求通过 `Authorization: Bearer <密码>` 请求头携带。
+- WebSocket、图片（`<img src>`）、`sendBeacon` 请求通过 `?password=` 查询参数携带，因为浏览器无法为这些请求设置自定义请求头。
+
+⚠️ **安全提示：**
+- 无 HTTPS 时密码为明文传输。请仅在可信局域网使用，或为后端套用 HTTPS / 加密隧道。
+- 查询参数中的密码可能出现在反向代理或访问日志中。
+- 不做登录失败限流或锁定。本功能面向局域网/个人使用，不适合公网暴露。
+
 ### 🔌 API 端点
 
 #### 书架端点
@@ -326,9 +409,9 @@ BonLivre/
 dotnet build
 ```
 
-发布生产版本：
+发布生产版本（会自动构建前端并打包进 `wwwroot/`，详见下方「部署」章节）：
 ```bash
-dotnet publish -c Release
+dotnet publish -c Release -r win-x64
 ```
 
 #### 前端开发
@@ -353,6 +436,39 @@ pnpm lint:fix
 ```bash
 pnpm format
 ```
+
+<a name="deployment-zh"></a>
+### 📦 部署
+
+后端会以静态文件形式托管前端，因此生产环境只需运行一个 Native AOT 可执行文件即可——无需为界面另起 Web 服务器。
+
+发布时会自动构建并打包前端。`BonLivre.csproj` 中的 `BuildFrontend` MSBuild target 会在 publish 前执行 `pnpm install` + `pnpm build`，并把 `web/dist/` 拷入 `wwwroot/`，因此一条命令即可产出「自包含可执行文件 + `wwwroot/`」：
+
+```bash
+dotnet publish -c Release -r win-x64      # Windows x64
+dotnet publish -c Release -r linux-x64    # Linux x64
+dotnet publish -c Release -r linux-arm64  # ARM（如树莓派）
+```
+
+产物位于 `bin/Release/net10.0/<RID>/publish/`。由于 Native AOT 编译为原生机器码，可执行文件与平台绑定：请在与部署目标相同的操作系统/架构上（或面向其）构建。构建机需具备 `pnpm` 工具链（Node >= 20、pnpm >= 9），AOT 步骤还需原生 C/C++ 工具链（Windows 上为 MSVC + Windows SDK，Linux 上为 clang/build-essential）。
+
+> **Windows：** AOT 链接步骤会调用 MSVC 的 `link.exe`，并通过 `vswhere.exe` 定位它。若发布时报 `'vswhere.exe' is not recognized` 或 `link.exe ... 已退出，代码为 123`，说明工具链不在 `PATH` 中。解决方式二选一：从 **“x64 Native Tools Command Prompt for VS 2022”** 命令行运行发布命令（它会配好 MSVC 环境），或通过 Visual Studio Installer 安装 **“使用 C++ 的桌面开发”** 工作负载（MSVC v143 + Windows SDK）。若只需框架依赖版本、无需 AOT，可加 `-p:PublishAot=false` 跳过该步骤。
+
+若只发布后端、跳过前端构建（例如仅调试 API 时）：
+
+```bash
+dotnet publish -c Release -r win-x64 -p:SkipFrontend=true
+```
+
+运行已发布的程序：
+
+```bash
+cd bin/Release/net10.0/win-x64/publish
+./BonLivre                                        # 开放模式
+BONLIVRE_PASSWORD=你的密码 ./BonLivre              # 启用认证
+```
+
+程序监听 `http://0.0.0.0:5000` 和 `:5001`。浏览器打开 `http://<主机>:5000/` 即可——前端与后端同源，无需单独配置后端地址。静态资源带内容 hash 并以 `immutable` 头长期缓存，而 `index.html` 以 `no-cache` 提供，因此重新部署会立即生效。
 
 ### 🌐 浏览器兼容性
 

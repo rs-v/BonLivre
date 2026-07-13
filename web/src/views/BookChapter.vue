@@ -108,7 +108,7 @@
 
 <script setup lang="ts">
 import jump from '@/plugins/jump'
-import settings from '@/config/themeConfig'
+import settings, { ensureFontStylesheet } from '@/config/themeConfig'
 import API from '@api'
 import { useLoading } from '@/hooks/loading'
 import { useThrottleFn } from '@vueuse/shared'
@@ -188,10 +188,18 @@ const onReachBottom = (entries: IntersectionObserverEntry[]) => {
 // 字体
 const fontFamily = computed(() => {
   if (store.config.font >= 0) {
-    return settings.fonts[store.config.font]
+    return settings.fonts[store.config.font]?.family ?? ''
   }
   return store.config.customFontName
 })
+// 选中预置网络字体时按需加载其样式表（幂等），立即执行以覆盖初始配置
+watch(
+  () => store.config.font,
+  font => {
+    if (font >= 0) ensureFontStylesheet(settings.fonts[font]?.stylesheet)
+  },
+  { immediate: true },
+)
 const fontSize = computed(() => {
   return store.config.fontSize + 'px'
 })
