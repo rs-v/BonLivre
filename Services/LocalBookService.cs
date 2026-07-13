@@ -7,7 +7,7 @@ using BonLivre.Models;
 
 namespace BonLivre.Services;
 
-public class LocalBookService
+public partial class LocalBookService
 {
     private readonly string _booksDir;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, EpubBook> _epubCache = new();
@@ -76,19 +76,11 @@ public class LocalBookService
         }
 
         var content = File.ReadAllText(filePath, Encoding.UTF8);
-        var chapters = new List<BookChapter>();
-        var matches = Regex.Matches(content, @"^\s*(第[零一二三四五六七八九十百千万\d]+[章节回卷集部篇]).*$", RegexOptions.Multiline);
-
-        if (matches.Count == 0)
+        var spans = BuildTxtChapters(content);
+        var chapters = new List<BookChapter>(spans.Count);
+        for (int i = 0; i < spans.Count; i++)
         {
-            chapters.Add(new BookChapter("正文", url, 0));
-        }
-        else
-        {
-            for (int i = 0; i < matches.Count; i++)
-            {
-                chapters.Add(new BookChapter(matches[i].Value.Trim(), $"{url}#{i}", i));
-            }
+            chapters.Add(new BookChapter(spans[i].Title, $"{url}#{i}", i, spans[i].IsVolume));
         }
         return chapters;
     }
@@ -152,16 +144,63 @@ public class LocalBookService
         }
 
         var content = File.ReadAllText(filePath, Encoding.UTF8);
-        var matches = Regex.Matches(content, @"^\s*(第[零一二三四五六七八九十百千万\d]+[章节回卷集部篇]).*$", RegexOptions.Multiline);
+        var spans = BuildTxtChapters(content);
 
-        if (matches.Count == 0) return content;
+        if (index < 0 || index >= spans.Count) return null;
 
-        if (index < 0 || index >= matches.Count) return null;
+        return content.Substring(spans[index].Start, spans[index].Length);
+    }
 
-        int startPos = matches[index].Index;
-        int endPos = (index + 1 < matches.Count) ? matches[index + 1].Index : content.Length;
+    /// <summary>TXT 章节切分结果：标题、在原文中的起始偏移与长度，以及是否为分卷标题。</summary>
+    private readonly record struct TxtChapterSpan(string Title, int Start, int Length, bool IsVolume);
 
-        return content.Substring(startPos, endPos - startPos);
+    // 章节标题正则（逐行匹配）。覆盖三类：
+    //   1. 「第X章/节/回/卷/集/部/篇 …」X 为中文数字或阿拉伯数字；
+    //   2. 无编号的特殊卷目：序/序章/序言/楔子/前言/引子/后记/尾声/番外/外传/终章；
+    //   3. 英文 Chapter N。
+    // 限定整行仅由「标题 + 可选副标题」构成（长度受限），避免正文段落中以「第…章」开头的句子被误判为标题。
+    [GeneratedRegex(
+        @"^[ \t　]*(?<title>(?:第[零一二三四五六七八九十百千万两0-9]{1,9}[章节回卷集部篇](?:[ \t　].{0,30})?|(?:序章|序言|序|楔子|前言|引子|后记|尾声|番外|外传|终章)(?:[ \t　].{0,30})?|(?:Chapter|CHAPTER)[ \t]+[0-9]{1,4}(?:[ \t].{0,30})?))[ \t　]*$",
+        RegexOptions.Multiline)]
+    private static partial Regex ChapterHeadingRegex();
+
+    // 分卷标题（卷/部/篇），前端可据 IsVolume 作层级展示；单独成章的「第X卷」等归为分卷。
+    [GeneratedRegex(@"[卷部篇]")]
+    private static partial Regex VolumeMarkerRegex();
+
+    /// <summary>
+    /// 将 TXT 全文按章节标题切分为若干区间。目录与正文共用此方法，保证章节索引一致。
+    /// 规则：无标题命中时整篇作为单章「正文」；首个标题之前若存在非空内容，保留为「前言」章，
+    /// 避免序言/引子被丢弃。
+    /// </summary>
+    private static List<TxtChapterSpan> BuildTxtChapters(string content)
+    {
+        var matches = ChapterHeadingRegex().Matches(content);
+        var spans = new List<TxtChapterSpan>();
+
+        if (matches.Count == 0)
+        {
+            spans.Add(new TxtChapterSpan("正文", 0, content.Length, false));
+            return spans;
+        }
+
+        // 首个标题之前的正文（序言/前言等），非空则保留为一章
+        int firstStart = matches[0].Index;
+        if (content.AsSpan(0, firstStart).Trim().Length > 0)
+        {
+            spans.Add(new TxtChapterSpan("前言", 0, firstStart, false));
+        }
+
+        for (int i = 0; i < matches.Count; i++)
+        {
+            int start = matches[i].Index;
+            int end = (i + 1 < matches.Count) ? matches[i + 1].Index : content.Length;
+            var title = matches[i].Groups["title"].Value.Trim();
+            bool isVolume = VolumeMarkerRegex().IsMatch(title);
+            spans.Add(new TxtChapterSpan(title, start, end - start, isVolume));
+        }
+
+        return spans;
     }
 
     private void ExtractTextWithImages(HtmlNode node, StringBuilder sb, string currentDir)
@@ -337,4 +376,88 @@ public class LocalBookService
         }
         return null;
     }
+
+    /// <summary>
+    /// EPUB 元数据中的标题；取不到时回退到文件名（不含扩展名）。
+    /// </summary>
+    public string GetEpubTitle(string path)
+    {
+        var fileName = path.Replace("local://", "");
+        var filePath = Path.Combine(_booksDir, fileName);
+        if (File.Exists(filePath) && filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                EpubBook book = GetOrAddEpub(filePath);
+                if (!string.IsNullOrWhiteSpace(book.Title)) return book.Title.Trim();
+            }
+            catch { }
+        }
+        return Path.GetFileNameWithoutExtension(fileName);
+    }
+
+    /// <summary>
+    /// 用标题文字生成一张 SVG 占位封面。Native AOT 下不依赖 System.Drawing 等原生图像库，
+    /// 直接拼字符串即可，矢量渲染在任意分辨率都清晰。
+    /// </summary>
+    public static byte[] GenerateTitleCoverSvg(string title)
+    {
+        const int width = 300;
+        const int height = 400;
+
+        // 稳定地由标题派生一个背景色，让不同书籍的占位封面有区分度。
+        int hash = 0;
+        foreach (var ch in title) hash = unchecked(hash * 31 + ch);
+        int hue = Math.Abs(hash) % 360;
+
+        var lines = WrapTitle(title, 8, 5);
+        // 垂直居中排布文本块。
+        const int lineHeight = 42;
+        double blockHeight = lines.Count * lineHeight;
+        double startY = (height - blockHeight) / 2 + lineHeight * 0.75;
+
+        var sb = new StringBuilder();
+        sb.Append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"").Append(width)
+          .Append("\" height=\"").Append(height)
+          .Append("\" viewBox=\"0 0 ").Append(width).Append(' ').Append(height).Append("\">");
+        sb.Append("<defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">")
+          .Append("<stop offset=\"0\" stop-color=\"hsl(").Append(hue).Append(",55%,42%)\"/>")
+          .Append("<stop offset=\"1\" stop-color=\"hsl(").Append((hue + 40) % 360).Append(",60%,28%)\"/>")
+          .Append("</linearGradient></defs>");
+        sb.Append("<rect width=\"").Append(width).Append("\" height=\"").Append(height).Append("\" fill=\"url(#g)\"/>");
+        sb.Append("<rect x=\"12\" y=\"12\" width=\"").Append(width - 24).Append("\" height=\"").Append(height - 24)
+          .Append("\" fill=\"none\" stroke=\"rgba(255,255,255,0.35)\" stroke-width=\"2\"/>");
+        sb.Append("<text x=\"").Append(width / 2)
+          .Append("\" text-anchor=\"middle\" fill=\"#ffffff\" font-family=\"serif\" font-size=\"32\" font-weight=\"bold\">");
+        for (int i = 0; i < lines.Count; i++)
+        {
+            sb.Append("<tspan x=\"").Append(width / 2)
+              .Append("\" y=\"").Append((int)(startY + i * lineHeight)).Append("\">")
+              .Append(EscapeXml(lines[i])).Append("</tspan>");
+        }
+        sb.Append("</text></svg>");
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
+    private static List<string> WrapTitle(string title, int charsPerLine, int maxLines)
+    {
+        title = title.Trim();
+        var lines = new List<string>();
+        for (int i = 0; i < title.Length && lines.Count < maxLines; i += charsPerLine)
+        {
+            lines.Add(title.Substring(i, Math.Min(charsPerLine, title.Length - i)));
+        }
+        // 文本被截断时在末行加省略号。
+        if (lines.Count == maxLines && maxLines * charsPerLine < title.Length)
+        {
+            var last = lines[maxLines - 1];
+            lines[maxLines - 1] = (last.Length > charsPerLine - 1 ? last.Substring(0, charsPerLine - 1) : last) + "…";
+        }
+        if (lines.Count == 0) lines.Add(title);
+        return lines;
+    }
+
+    private static string EscapeXml(string s) =>
+        s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+         .Replace("\"", "&quot;").Replace("'", "&apos;");
 }

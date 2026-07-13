@@ -151,6 +151,11 @@ public static class BookshelfEndpoints
             {
                 var cover = localService.GetEpubCover(path);
                 if (cover != null) return Results.File(cover, "image/jpeg");
+
+                // EPUB 无内嵌封面时，用标题元数据生成一张 SVG 占位封面。
+                var title = localService.GetEpubTitle(path);
+                var svg = LocalBookService.GenerateTitleCoverSvg(title);
+                return Results.File(svg, "image/svg+xml");
             }
             return Results.Redirect(path);
         });
