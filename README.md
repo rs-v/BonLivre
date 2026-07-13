@@ -198,6 +198,18 @@ pnpm format
 <a name="deployment"></a>
 ### 📦 Deployment
 
+#### Prebuilt binaries (CI artifacts)
+
+Every push to `main` builds self-contained executables for **Windows x64** and **Linux x64** via GitHub Actions. To grab one without building locally:
+
+1. Open the **Actions** tab on GitHub and pick the latest successful **CI** run.
+2. Download the `bonlivre-win-x64` or `bonlivre-linux-x64` artifact from the run's **Artifacts** section.
+3. Unzip it, then run the `BonLivre` executable (see [Running the published app](#running) below).
+
+Each artifact is a native executable bundled with the frontend `wwwroot/`, so no .NET runtime or Node toolchain is needed on the target machine. Artifacts are retained for 7 days.
+
+#### Building locally
+
 The backend serves the frontend as static files, so a single Native AOT executable is all you need to run in production — no separate web server for the UI.
 
 Publishing builds the frontend and bundles it automatically. The `BuildFrontend` MSBuild target (in `BonLivre.csproj`) runs `pnpm install` + `pnpm build` and copies `web/dist/` into `wwwroot/` before publish, so one command produces a self-contained executable plus its `wwwroot/`:
@@ -218,6 +230,7 @@ To publish the backend only and skip the frontend build (e.g. when iterating on 
 dotnet publish -c Release -r win-x64 -p:SkipFrontend=true
 ```
 
+<a name="running"></a>
 Running the published app:
 
 ```bash
@@ -440,6 +453,18 @@ pnpm format
 <a name="deployment-zh"></a>
 ### 📦 部署
 
+#### 预编译产物（CI 构建）
+
+每次推送到 `main` 分支，GitHub Actions 都会为 **Windows x64** 和 **Linux x64** 构建自包含可执行文件。无需本地构建即可获取：
+
+1. 打开 GitHub 的 **Actions** 标签页，选择最近一次成功的 **CI** 运行。
+2. 在该运行的 **Artifacts** 区域下载 `bonlivre-win-x64` 或 `bonlivre-linux-x64` 产物。
+3. 解压后运行其中的 `BonLivre` 可执行文件（见下方[运行已发布的程序](#running-zh)）。
+
+每个产物都是原生可执行文件，且已打包前端 `wwwroot/`，目标机器无需安装 .NET 运行时或 Node 工具链。产物保留 7 天。
+
+#### 本地构建
+
 后端会以静态文件形式托管前端，因此生产环境只需运行一个 Native AOT 可执行文件即可——无需为界面另起 Web 服务器。
 
 发布时会自动构建并打包前端。`BonLivre.csproj` 中的 `BuildFrontend` MSBuild target 会在 publish 前执行 `pnpm install` + `pnpm build`，并把 `web/dist/` 拷入 `wwwroot/`，因此一条命令即可产出「自包含可执行文件 + `wwwroot/`」：
@@ -460,6 +485,7 @@ dotnet publish -c Release -r linux-arm64  # ARM（如树莓派）
 dotnet publish -c Release -r win-x64 -p:SkipFrontend=true
 ```
 
+<a name="running-zh"></a>
 运行已发布的程序：
 
 ```bash
