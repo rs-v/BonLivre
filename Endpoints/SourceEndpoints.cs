@@ -68,9 +68,12 @@ public static class SourceEndpoints
                             if (string.IsNullOrWhiteSpace(json)) continue;
 
                             SearchRequest? searchRequest = null;
-                            try {
+                            try
+                            {
                                 searchRequest = JsonSerializer.Deserialize(json, AppJsonSerializerContext.Default.SearchRequest);
-                            } catch (Exception ex) {
+                            }
+                            catch (Exception ex)
+                            {
                                 Console.WriteLine($"[WebSocket] Deserialization error: {ex.Message}");
                             }
 

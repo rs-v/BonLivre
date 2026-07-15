@@ -23,6 +23,31 @@ public partial class LocalBookService
         return _epubCache.GetOrAdd(filePath, (path) => EpubReader.ReadBook(path));
     }
 
+    /// <summary>
+    /// 从 local:// URL 解析出 books/ 目录内的真实文件路径，并阻止路径穿越。
+    /// 取 '#' 之前的文件名部分，与 _booksDir 拼接并用 GetFullPath 规范化；
+    /// 若规范化结果逃逸出 _booksDir（如 ../ 穿越），返回 null。所有本地文件访问都应经此解析。
+    /// 这里不能做 URL 解码：BookUrl 由原始文件名生成，查询参数又已被 ASP.NET 解码过一次，
+    /// 再解码会破坏含 '+' 或 %xx 形态字符的文件名（'+' 会变成空格）。
+    /// </summary>
+    private string? ResolveLocalPath(string url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
+
+        var fileName = url.Replace("local://", "").Split('#')[0];
+        if (string.IsNullOrEmpty(fileName)) return null;
+
+        var baseDir = Path.GetFullPath(_booksDir);
+        var fullPath = Path.GetFullPath(Path.Combine(baseDir, fileName));
+
+        var baseWithSep = baseDir.EndsWith(Path.DirectorySeparatorChar)
+            ? baseDir
+            : baseDir + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(baseWithSep, StringComparison.OrdinalIgnoreCase)) return null;
+
+        return fullPath;
+    }
+
     public List<Book> GetLocalBooks()
     {
         var bookshelf = new List<Book>();
@@ -49,10 +74,8 @@ public partial class LocalBookService
 
     public List<BookChapter>? GetChapterList(string url)
     {
-        var fileName = url.Replace("local://", "").Split('#')[0];
-        var filePath = Path.Combine(_booksDir, fileName);
-
-        if (!File.Exists(filePath)) return null;
+        var filePath = ResolveLocalPath(url);
+        if (filePath == null || !File.Exists(filePath)) return null;
 
         if (filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
         {
@@ -87,11 +110,8 @@ public partial class LocalBookService
 
     public string? GetBookContent(string url, int index)
     {
-        var rawUrl = url.Split('#')[0];
-        var fileName = rawUrl.Replace("local://", "");
-        var filePath = Path.Combine(_booksDir, fileName);
-
-        if (!File.Exists(filePath)) return null;
+        var filePath = ResolveLocalPath(url);
+        if (filePath == null || !File.Exists(filePath)) return null;
 
         if (filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
         {
@@ -255,19 +275,17 @@ public partial class LocalBookService
     {
         try
         {
-            var fileName = bookUrl.Replace("local://", "");
-            fileName = System.Net.WebUtility.UrlDecode(fileName);
-            var filePath = Path.Combine(_booksDir, fileName);
-
-            if (!File.Exists(filePath))
+            var filePath = ResolveLocalPath(bookUrl);
+            if (filePath == null || !File.Exists(filePath))
             {
-                Console.WriteLine($"[EPUB Resource] File not found: {filePath}");
+                Console.WriteLine($"[EPUB Resource] File not found or invalid path for: {bookUrl}");
                 return null;
             }
 
             EpubBook book = GetOrAddEpub(filePath);
 
-            // 规范化目标路径
+            // 规范化目标路径。与 ResolveLocalPath 不同，这里必须解码：正文里的 img src
+            // 由 ExtractTextWithImages 用 Uri.AbsolutePath 生成，是 percent-escaped 的。
             var targetPath = System.Net.WebUtility.UrlDecode(resourcePath).Replace("\\", "/").Trim().TrimStart('/');
             // 处理路径中的 ../
             if (targetPath.Contains("../"))
@@ -363,16 +381,18 @@ public partial class LocalBookService
 
     public byte[]? GetEpubCover(string path)
     {
-        var fileName = path.Replace("local://", "");
-        var filePath = Path.Combine(_booksDir, fileName);
-        if (File.Exists(filePath) && filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+        var filePath = ResolveLocalPath(path);
+        if (filePath != null && File.Exists(filePath) && filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
         {
             try
             {
                 EpubBook book = GetOrAddEpub(filePath);
                 return book.CoverImage;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[EPUB Cover Error] path={path} ex={ex.Message}");
+            }
         }
         return null;
     }
@@ -382,18 +402,22 @@ public partial class LocalBookService
     /// </summary>
     public string GetEpubTitle(string path)
     {
-        var fileName = path.Replace("local://", "");
-        var filePath = Path.Combine(_booksDir, fileName);
-        if (File.Exists(filePath) && filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+        var filePath = ResolveLocalPath(path);
+        if (filePath != null && File.Exists(filePath) && filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
         {
             try
             {
                 EpubBook book = GetOrAddEpub(filePath);
                 if (!string.IsNullOrWhiteSpace(book.Title)) return book.Title.Trim();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[EPUB Title Error] path={path} ex={ex.Message}");
+            }
         }
-        return Path.GetFileNameWithoutExtension(fileName);
+        // 回退到文件名（不含扩展名）；解析失败时从原始 URL 尽力提取。
+        var rawName = path.Replace("local://", "").Split('#')[0];
+        return Path.GetFileNameWithoutExtension(rawName);
     }
 
     /// <summary>

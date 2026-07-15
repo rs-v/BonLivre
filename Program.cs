@@ -1,4 +1,4 @@
-﻿using BonLivre.Endpoints;
+using BonLivre.Endpoints;
 using BonLivre.Configuration;
 
 var builder = WebApplication.CreateBuilder(args);

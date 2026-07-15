@@ -34,7 +34,8 @@ public record BookProgress(
     int DurChapterIndex,
     int DurChapterPos,
     long DurChapterTime,
-    string DurChapterTitle
+    string DurChapterTitle,
+    string BookUrl = ""
 );
 
 public record BookChapter(

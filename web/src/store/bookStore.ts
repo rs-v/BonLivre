@@ -48,12 +48,14 @@ export const useBookStore = defineStore('book', {
   getters: {
     bookProgress: (state): BookProgress | undefined => {
       if (state.catalog.length == 0) return
-      const { chapterIndex, chapterPos, name, author } = state.readingBook
+      const { chapterIndex, chapterPos, name, author, bookUrl } =
+        state.readingBook
       const title = state.catalog[chapterIndex]?.title
       if (!title) return
       return {
         name,
         author,
+        bookUrl,
         durChapterIndex: chapterIndex,
         durChapterPos: chapterPos,
         durChapterTime: new Date().getTime(),

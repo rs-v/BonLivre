@@ -9,21 +9,34 @@ namespace BonLivre.Endpoints;
 public static class BookshelfEndpoints
 {
     private static List<Book> _bookshelf = new();
-    private static string _readConfig = "{}";
+    // _bookshelf 采用 copy-on-write：Results.Json 在 handler 返回（锁已释放）后才真正序列化，
+    // 所以任何已交给 Results.Json 的 List 实例都不能再被原地修改；
+    // 修改一律在锁内“复制 → 改副本 → 替换引用”，锁只保护这一步。
+    private static readonly object _bookshelfLock = new();
+
+    private const string ReadConfigKey = "readConfig";
 
     public static void MapBookshelfEndpoints(this IEndpointRouteBuilder app)
     {
         var localService = new LocalBookService();
-        _bookshelf = localService.GetLocalBooks();
+        lock (_bookshelfLock)
+        {
+            _bookshelf = localService.GetLocalBooks();
+        }
         var progressStore = new BookProgressStore();
+        var settingsStore = new SettingsStore();
 
         app.MapGet("/getReadConfig", () =>
-            Results.Json(new LeagdoApiResponse<string>(true, "", _readConfig), AppJsonSerializerContext.Default.LeagdoApiResponseString));
+        {
+            var readConfig = settingsStore.Get(ReadConfigKey, "{}");
+            return Results.Json(new LeagdoApiResponse<string>(true, "", readConfig), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+        });
 
         app.MapPost("/saveReadConfig", async (HttpRequest request) =>
         {
             using var reader = new StreamReader(request.Body);
-            _readConfig = await reader.ReadToEndAsync();
+            var readConfig = await reader.ReadToEndAsync();
+            settingsStore.Set(ReadConfigKey, readConfig);
             return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
         });
 
@@ -68,7 +81,9 @@ public static class BookshelfEndpoints
 
             var mergedBooks = books.Select(book =>
             {
-                var progress = allProgress.FirstOrDefault(p => p.Name == book.Name && p.Author == book.Author);
+                // 优先按唯一的 BookUrl 匹配；迁移自旧库、BookUrl 不精确的行回退到 (Name, Author)。
+                var progress = allProgress.FirstOrDefault(p => p.BookUrl == book.BookUrl)
+                    ?? allProgress.FirstOrDefault(p => p.Name == book.Name && p.Author == book.Author);
                 if (progress != null)
                 {
                     return book with
@@ -82,38 +97,66 @@ public static class BookshelfEndpoints
                 return book;
             }).ToList();
 
-            _bookshelf = mergedBooks;
-            return Results.Json(new LeagdoApiResponse<List<Book>>(true, "", _bookshelf), AppJsonSerializerContext.Default.LeagdoApiResponseListBook);
+            lock (_bookshelfLock)
+            {
+                _bookshelf = mergedBooks;
+            }
+            // 序列化局部 mergedBooks，而非共享字段：saveBook/deleteBook 会替换 _bookshelf 引用，
+            // 但绝不原地改动，故这个局部列表在序列化期间不会被并发修改。
+            return Results.Json(new LeagdoApiResponse<List<Book>>(true, "", mergedBooks), AppJsonSerializerContext.Default.LeagdoApiResponseListBook);
         });
+
+        // saveBook / deleteBook 共用：读取请求体并反序列化为 Book。失败返回 null。
+        static async Task<Book?> ReadBookAsync(HttpRequest request)
+        {
+            using var reader = new StreamReader(request.Body);
+            var content = await reader.ReadToEndAsync();
+            return JsonSerializer.Deserialize(content, AppJsonSerializerContext.Default.Book);
+        }
 
         app.MapPost("/saveBook", async (HttpRequest request) =>
         {
-            try {
-                using var reader = new StreamReader(request.Body);
-                var content = await reader.ReadToEndAsync();
-                var book = System.Text.Json.JsonSerializer.Deserialize(content, AppJsonSerializerContext.Default.Book);
-                if (book != null) {
-                    _bookshelf.RemoveAll(b => b.BookUrl == book.BookUrl);
-                    _bookshelf.Add(book);
+            try
+            {
+                var book = await ReadBookAsync(request);
+                if (book != null)
+                {
+                    lock (_bookshelfLock)
+                    {
+                        // copy-on-write：新建列表并替换引用，绝不原地修改可能正被序列化的旧列表。
+                        var updated = _bookshelf.Where(b => b.BookUrl != book.BookUrl).ToList();
+                        updated.Add(book);
+                        _bookshelf = updated;
+                    }
                 }
                 return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
-            } catch {
-                return Results.Json(new LeagdoApiResponse<string>(false, "Deserialization failed", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[saveBook Error]: {ex.Message}");
+                return Results.Json(new LeagdoApiResponse<string>(false, "解析书籍数据失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
         });
 
         app.MapPost("/deleteBook", async (HttpRequest request) =>
         {
-             try {
-                using var reader = new StreamReader(request.Body);
-                var content = await reader.ReadToEndAsync();
-                var book = System.Text.Json.JsonSerializer.Deserialize(content, AppJsonSerializerContext.Default.Book);
-                if (book != null) {
-                    _bookshelf.RemoveAll(b => b.BookUrl == book.BookUrl);
+            try
+            {
+                var book = await ReadBookAsync(request);
+                if (book != null)
+                {
+                    lock (_bookshelfLock)
+                    {
+                        // copy-on-write，同 saveBook。
+                        _bookshelf = _bookshelf.Where(b => b.BookUrl != book.BookUrl).ToList();
+                    }
                 }
                 return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
-            } catch {
-                return Results.Json(new LeagdoApiResponse<string>(false, "Deserialization failed", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[deleteBook Error]: {ex.Message}");
+                return Results.Json(new LeagdoApiResponse<string>(false, "解析书籍数据失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
         });
 
@@ -157,7 +200,13 @@ public static class BookshelfEndpoints
                 var svg = LocalBookService.GenerateTitleCoverSvg(title);
                 return Results.File(svg, "image/svg+xml");
             }
-            return Results.Redirect(path);
+            // 非本地封面：仅允许重定向到合法的 http(s) 绝对地址，避免开放重定向。
+            if (Uri.TryCreate(path, UriKind.Absolute, out var uri) &&
+                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+            {
+                return Results.Redirect(uri.AbsoluteUri);
+            }
+            return Results.NotFound();
         });
 
         app.MapGet("/image", (string url, string path, int? width) =>
@@ -180,9 +229,8 @@ public static class BookshelfEndpoints
             catch (Exception ex)
             {
                 Console.WriteLine($"[Image EndPoint Critical Error]: url={url}, path={path}\n{ex}");
-                // 暂时返回详细信息以供调试
                 return Results.Problem(
-                    detail: ex.ToString(),
+                    detail: "读取图片资源失败",
                     statusCode: 500,
                     title: "EPUB Image Resource Error"
                 );
