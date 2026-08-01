@@ -1,8 +1,23 @@
+using System.Text;
 using BonLivre.Endpoints;
 using BonLivre.Configuration;
 
+// 注册 GBK/GB18030 等代码页编码，供 LocalBookService 读取非 UTF-8 的中文 TXT。
+Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls("http://0.0.0.0:5000", "http://0.0.0.0:5001");
+// /uploadBook 接收整本 EPUB，Kestrel 默认 ~28.6MB 请求体上限不够用，放宽到 512MB。
+// multipart 表单解析另有 FormOptions 的 128MB 上限，需同步放宽。
+const long uploadLimit = 512L * 1024 * 1024;
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = uploadLimit;
+});
+builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = uploadLimit;
+});
 
 // 配置 CORS
 builder.Services.AddCors(options =>

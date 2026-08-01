@@ -18,12 +18,41 @@ public static class SourceEndpoints
         app.MapGet("/getBookSources", () =>
             Results.Json(new LeagdoApiResponse<List<object>>(true, "", _bookSources), AppJsonSerializerContext.Default.LeagdoApiResponseListObject));
 
-        app.MapPost("/saveBookSource", async (HttpRequest request) =>
+        // rss 源与书源的批量保存/删除：本地后端不支持源，全部返回成功空结果，
+        // 让前端源编辑页可以打开而不是收到 404 报错。
+        app.MapGet("/getRssSources", () =>
+            Results.Json(new LeagdoApiResponse<List<object>>(true, "", new List<object>()), AppJsonSerializerContext.Default.LeagdoApiResponseListObject));
+
+        // 保存/删除类端点共用的成功空响应。请求体不读取也无妨：中间件会替我们排干。
+        static IResult OkStub() =>
+            Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+
+        app.MapPost("/saveBookSource", OkStub);
+        app.MapPost("/saveBookSources", OkStub);
+        app.MapPost("/deleteBookSources", OkStub);
+        app.MapPost("/saveRssSource", OkStub);
+        app.MapPost("/saveRssSources", OkStub);
+        app.MapPost("/deleteRssSources", OkStub);
+
+        // 源调试 WebSocket 桩：接受连接，说明本地后端不支持调试，然后正常关闭，
+        // 避免前端调试面板报连接错误。
+        static void MapDebugStub(IEndpointRouteBuilder routes, string path)
         {
-            using var reader = new StreamReader(request.Body);
-            var content = await reader.ReadToEndAsync();
-            return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
-        });
+            routes.Map(path, async context =>
+            {
+                if (!context.WebSockets.IsWebSocketRequest)
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    return;
+                }
+                using var ws = await context.WebSockets.AcceptWebSocketAsync();
+                var msg = Encoding.UTF8.GetBytes("本地后端不支持源调试。");
+                await ws.SendAsync(new ArraySegment<byte>(msg), WebSocketMessageType.Text, true, CancellationToken.None);
+                await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", CancellationToken.None);
+            });
+        }
+        MapDebugStub(app, "/bookSourceDebug");
+        MapDebugStub(app, "/rssSourceDebug");
 
         app.Map("/searchBook", async (context) =>
         {
@@ -111,9 +140,18 @@ public static class SourceEndpoints
                 }
                 finally
                 {
+                    // 正常关闭（客户端主动断开或搜索结束）用 NormalClosure；
+                    // 之前误用 InternalServerError，前端会把正常断开当作错误提示。
                     if (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseReceived)
                     {
-                        await webSocket.CloseAsync(WebSocketCloseStatus.InternalServerError, "Error occurred", CancellationToken.None);
+                        try
+                        {
+                            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[WebSocket] Close error: {ex.Message}");
+                        }
                     }
                     Console.WriteLine("[WebSocket] Connection closed.");
                 }

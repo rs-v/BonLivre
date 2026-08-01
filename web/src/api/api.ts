@@ -131,6 +131,20 @@ const saveBook = (book: BaseBook) =>
 const deleteBook = (book: BaseBook) =>
   ajax.post<LeagdoApiResponse<string>>('deleteBook', book)
 
+/**
+ * 上传本地书籍文件（.txt/.epub）到后端 books/ 目录。
+ * BonLivre 专有端点，legado 原版后端无此接口。
+ */
+const uploadBook = (files: File[], overwrite = false) => {
+  const formData = new FormData()
+  files.forEach(file => formData.append('file', file, file.name))
+  return ajax.post<LeagdoApiResponse<string>>(
+    'uploadBook' + (overwrite ? '?overwrite=true' : ''),
+    formData,
+    { timeout: 0 },
+  )
+}
+
 const isBookSource = /bookSource/i.test(location.href)
 
 // 源编辑API
@@ -205,7 +219,8 @@ const getProxyImageUrl = (
   src: string,
   width: number | `${number}`,
 ) => {
-  if (src.startsWith(legado_http_entry_point)) return withPassword(src).toString()
+  if (src.startsWith(legado_http_entry_point))
+    return withPassword(src).toString()
   return withPassword(
     new URL(
       'image?path=' +
@@ -230,6 +245,7 @@ export default {
   search,
   saveBook,
   deleteBook,
+  uploadBook,
 
   getSources,
   saveSources,

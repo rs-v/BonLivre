@@ -81,8 +81,12 @@ public static class BookshelfEndpoints
 
             var mergedBooks = books.Select(book =>
             {
-                // 优先按唯一的 BookUrl 匹配；迁移自旧库、BookUrl 不精确的行回退到 (Name, Author)。
+                // 优先按唯一的 BookUrl 匹配；迁移自旧库的行 BookUrl 是合成键
+                // 'local://' + 旧 Name（旧 Name 即无扩展名文件名），其次按它匹配；
+                // 最后回退到 (Name, Author)。
+                var legacyKey = $"local://{Path.GetFileNameWithoutExtension(book.BookUrl.Replace("local://", ""))}";
                 var progress = allProgress.FirstOrDefault(p => p.BookUrl == book.BookUrl)
+                    ?? allProgress.FirstOrDefault(p => p.BookUrl == legacyKey)
                     ?? allProgress.FirstOrDefault(p => p.Name == book.Name && p.Author == book.Author);
                 if (progress != null)
                 {
@@ -150,6 +154,12 @@ public static class BookshelfEndpoints
                         // copy-on-write，同 saveBook。
                         _bookshelf = _bookshelf.Where(b => b.BookUrl != book.BookUrl).ToList();
                     }
+                    // 仅移内存的话，下一次 getBookshelf 重扫 books/ 书又会回来。
+                    // 真正把文件移入 books/.trash/ 回收站（可手动恢复）。
+                    if (book.BookUrl.StartsWith("local://"))
+                    {
+                        localService.DeleteLocalBook(book.BookUrl);
+                    }
                 }
                 return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
@@ -157,6 +167,49 @@ public static class BookshelfEndpoints
             {
                 Console.WriteLine($"[deleteBook Error]: {ex.Message}");
                 return Results.Json(new LeagdoApiResponse<string>(false, "解析书籍数据失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+        });
+
+        // 上传书籍：multipart/form-data，字段名任意，取每个上传文件的原始文件名存入 books/。
+        // ?overwrite=true 允许覆盖同名文件。前端暂无对应入口，供脚本/curl 使用：
+        //   curl -F "file=@book.epub" http://host:5000/uploadBook
+        app.MapPost("/uploadBook", async (HttpRequest request, bool? overwrite) =>
+        {
+            try
+            {
+                if (!request.HasFormContentType)
+                {
+                    return Results.Json(new LeagdoApiResponse<string>(false, "需要 multipart/form-data 上传", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+
+                var form = await request.ReadFormAsync(request.HttpContext.RequestAborted);
+                if (form.Files.Count == 0)
+                {
+                    return Results.Json(new LeagdoApiResponse<string>(false, "未收到文件", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+
+                var saved = new List<string>();
+                foreach (var file in form.Files)
+                {
+                    await using var stream = file.OpenReadStream();
+                    var (ok, message, bookUrl) = await localService.SaveUploadedBookAsync(
+                        file.FileName, stream, overwrite == true);
+                    if (!ok)
+                    {
+                        return Results.Json(new LeagdoApiResponse<string>(false, $"{file.FileName}: {message}", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                    }
+                    saved.Add(bookUrl);
+                }
+                return Results.Json(new LeagdoApiResponse<string>(true, "", string.Join("\n", saved)), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(new LeagdoApiResponse<string>(false, "请求已取消", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[uploadBook Error]: {ex}");
+                return Results.Json(new LeagdoApiResponse<string>(false, "保存上传文件失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
         });
 
@@ -190,13 +243,16 @@ public static class BookshelfEndpoints
 
         app.MapGet("/cover", (string path) =>
         {
-            if (path.StartsWith("local://") && path.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+            if (path.StartsWith("local://"))
             {
-                var cover = localService.GetEpubCover(path);
-                if (cover != null) return Results.File(cover, "image/jpeg");
+                if (path.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+                {
+                    var cover = localService.GetEpubCover(path);
+                    if (cover != null) return Results.File(cover, LocalBookService.DetectImageMime(cover));
+                }
 
-                // EPUB 无内嵌封面时，用标题元数据生成一张 SVG 占位封面。
-                var title = localService.GetEpubTitle(path);
+                // EPUB 无内嵌封面、或 TXT 书籍：用标题生成一张 SVG 占位封面。
+                var title = localService.GetLocalBookTitle(path);
                 var svg = LocalBookService.GenerateTitleCoverSvg(title);
                 return Results.File(svg, "image/svg+xml");
             }

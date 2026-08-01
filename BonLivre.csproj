@@ -8,10 +8,10 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <!--
       web/ 是前端源码目录。Web SDK 默认会把项目下的 **/*.json、**/*.ts 等当作
-      Content 打进产物，导致 web/package.json、tsconfig*.json 混入发布目录。
-      整个排除 web/，前端产物由下方 target 显式注入。
+      Content 打进产物，导致前端的 package.json、tsconfig*.json 混入发布目录。
+      整个排除前端目录，前端产物由下方 target 显式注入。
     -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);web\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);web\**;web-svelte\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,13 +29,11 @@
     先构建前端，再把 web/dist/** 直接作为 ResolvedFileToPublish 注入发布文件列表，
     目标相对路径设为 wwwroot/…，绕开求值期 glob 的时序问题。
   -->
-  <Target Name="BuildFrontend"
-          BeforeTargets="ComputeFilesToPublish"
-          Condition="'$(SkipFrontend)' != 'true'">
-    <Exec Command="pnpm install --frozen-lockfile" WorkingDirectory="web" />
-    <Exec Command="pnpm build" WorkingDirectory="web" />
+  <Target Name="BuildFrontend" BeforeTargets="ComputeFilesToPublish" Condition="'$(SkipFrontend)' != 'true'">
+    <Exec Command="pnpm install --frozen-lockfile" WorkingDirectory="web-svelte" />
+    <Exec Command="pnpm build" WorkingDirectory="web-svelte" />
     <ItemGroup>
-      <_FrontendDist Include="web\dist\**\*" />
+      <_FrontendDist Include="web-svelte\dist\**\*" />
       <ResolvedFileToPublish Include="@(_FrontendDist)">
         <RelativePath>wwwroot\%(_FrontendDist.RecursiveDir)%(_FrontendDist.Filename)%(_FrontendDist.Extension)</RelativePath>
         <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>

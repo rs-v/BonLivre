@@ -1,0 +1,295 @@
+/*
+ * Material Design 3 设计令牌（绿色 seed 调和色板）。
+ * 亮/暗两套色彩令牌：html[data-color-scheme] 由 colorScheme.svelte.ts 控制，
+ * 'light'/'dark' 为手动指定，'auto'（或缺省）时跟随系统 prefers-color-scheme。
+ * 阅读器正文区域用自己的主题色（themes.ts），不受这里约束。
+ */
+
+/* 浅色令牌（默认） */
+:root,
+html[data-color-scheme='light'] {
+  --md-primary: #38693c;
+  --md-on-primary: #ffffff;
+  --md-primary-container: #b9f0b8;
+  --md-on-primary-container: #002105;
+  --md-secondary: #526350;
+  --md-on-secondary: #ffffff;
+  --md-secondary-container: #d5e8d0;
+  --md-on-secondary-container: #101f10;
+  --md-surface: #f7fbf1;
+  --md-surface-dim: #d7dbd2;
+  --md-surface-container-lowest: #ffffff;
+  --md-surface-container-low: #f1f5eb;
+  --md-surface-container: #ebefe6;
+  --md-surface-container-high: #e6e9e0;
+  --md-surface-container-highest: #e0e4da;
+  --md-on-surface: #181d17;
+  --md-on-surface-variant: #424940;
+  --md-outline: #72796f;
+  --md-outline-variant: #c2c9bd;
+  --md-error: #ba1a1a;
+  --md-on-error: #ffffff;
+  --md-inverse-surface: #2d322c;
+  --md-inverse-on-surface: #eef2e9;
+  --md-scrim: rgba(0, 0, 0, 0.4);
+}
+
+/* 深色令牌：同一 seed 的 MD3 暗色调和。
+   .md-dark 为局部强制深色（阅读器夜间主题时挂在其根元素，UI 跟随夜间） */
+html[data-color-scheme='dark'],
+.md-dark {
+  --md-primary: #9ed49f;
+  --md-on-primary: #043912;
+  --md-primary-container: #205026;
+  --md-on-primary-container: #b9f0b8;
+  --md-secondary: #b9ccb4;
+  --md-on-secondary: #253423;
+  --md-secondary-container: #3b4b39;
+  --md-on-secondary-container: #d5e8d0;
+  --md-surface: #101410;
+  --md-surface-dim: #101410;
+  --md-surface-container-lowest: #0b0f0b;
+  --md-surface-container-low: #181d17;
+  --md-surface-container: #1c211b;
+  --md-surface-container-high: #262b25;
+  --md-surface-container-highest: #313630;
+  --md-on-surface: #e0e4da;
+  --md-on-surface-variant: #c2c9bd;
+  --md-outline: #8c9388;
+  --md-outline-variant: #424940;
+  --md-error: #ffb4ab;
+  --md-on-error: #690005;
+  --md-inverse-surface: #e0e4da;
+  --md-inverse-on-surface: #2d322c;
+  --md-scrim: rgba(0, 0, 0, 0.6);
+}
+
+/* auto 模式（未设 data-color-scheme 或值为 auto）下跟随系统深色 */
+@media (prefers-color-scheme: dark) {
+  html:not([data-color-scheme='light']):not([data-color-scheme='dark']) {
+    --md-primary: #9ed49f;
+    --md-on-primary: #043912;
+    --md-primary-container: #205026;
+    --md-on-primary-container: #b9f0b8;
+    --md-secondary: #b9ccb4;
+    --md-on-secondary: #253423;
+    --md-secondary-container: #3b4b39;
+    --md-on-secondary-container: #d5e8d0;
+    --md-surface: #101410;
+    --md-surface-dim: #101410;
+    --md-surface-container-lowest: #0b0f0b;
+    --md-surface-container-low: #181d17;
+    --md-surface-container: #1c211b;
+    --md-surface-container-high: #262b25;
+    --md-surface-container-highest: #313630;
+    --md-on-surface: #e0e4da;
+    --md-on-surface-variant: #c2c9bd;
+    --md-outline: #8c9388;
+    --md-outline-variant: #424940;
+    --md-error: #ffb4ab;
+    --md-on-error: #690005;
+    --md-inverse-surface: #e0e4da;
+    --md-inverse-on-surface: #2d322c;
+    --md-scrim: rgba(0, 0, 0, 0.6);
+  }
+}
+
+:root {
+  /* Elevation（阴影） */
+  --md-elevation-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px 1px rgba(0, 0, 0, 0.15);
+  --md-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 6px 2px rgba(0, 0, 0, 0.15);
+  --md-elevation-3: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 8px 3px rgba(0, 0, 0, 0.15);
+
+  /* Shape */
+  --md-shape-xs: 4px;
+  --md-shape-sm: 8px;
+  --md-shape-md: 12px;
+  --md-shape-lg: 16px;
+  --md-shape-xl: 28px;
+  --md-shape-full: 999px;
+
+  font-family:
+    Roboto,
+    system-ui,
+    -apple-system,
+    'PingFang SC',
+    'Microsoft YaHei',
+    sans-serif;
+}
+
+/* 系统 UI（滚动条、表单控件、input 深色键盘）跟随当前配色 */
+:root,
+html[data-color-scheme='light'] {
+  color-scheme: light;
+}
+
+html[data-color-scheme='dark'] {
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-color-scheme='light']):not([data-color-scheme='dark']) {
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--md-surface);
+  color: var(--md-on-surface);
+  -webkit-font-smoothing: antialiased;
+  /* 移动端：去掉点按高亮方块，禁止滚动到边缘时整页橡皮筋/下拉刷新 */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+  transition:
+    background 0.2s,
+    color 0.2s;
+}
+
+#app {
+  height: 100%;
+}
+
+/* ---------- MD3 通用组件类 ---------- */
+
+/* Filled button */
+button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--md-shape-full);
+  padding: 10px 24px;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  transition:
+    box-shadow 0.15s,
+    background 0.15s,
+    opacity 0.15s;
+  position: relative;
+}
+
+button:hover {
+  box-shadow: var(--md-elevation-1);
+  opacity: 0.92;
+}
+
+button:disabled {
+  opacity: 0.38;
+  pointer-events: none;
+}
+
+/* Text button：工具栏、次级操作 */
+.btn-text {
+  background: transparent;
+  color: var(--md-primary);
+  box-shadow: none;
+  padding: 10px 12px;
+}
+
+.btn-text:hover {
+  background: color-mix(in srgb, var(--md-primary) 8%, transparent);
+  box-shadow: none;
+}
+
+/* Outlined button */
+.btn-outlined {
+  background: transparent;
+  color: var(--md-primary);
+  border: 1px solid var(--md-outline);
+}
+
+.btn-outlined:hover {
+  background: color-mix(in srgb, var(--md-primary) 8%, transparent);
+  box-shadow: none;
+}
+
+/* Tonal button */
+.btn-tonal {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+/* Icon button */
+.btn-icon {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: var(--md-shape-full);
+  background: transparent;
+  color: var(--md-on-surface-variant);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+}
+
+.btn-icon:hover {
+  background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+  box-shadow: none;
+}
+
+/* Outlined text field */
+input {
+  font: inherit;
+  border: 1px solid var(--md-outline);
+  border-radius: var(--md-shape-xs);
+  padding: 12px 16px;
+  background: transparent;
+  color: var(--md-on-surface);
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+
+input:focus {
+  border: 2px solid var(--md-primary);
+  padding: 11px 15px;
+}
+
+input::placeholder {
+  color: var(--md-on-surface-variant);
+}
+
+/* iOS Safari 在输入框字号 <16px 时聚焦会自动放大页面，移动端强制 16px 规避 */
+@media (max-width: 750px) {
+  input {
+    font-size: 16px;
+  }
+}
+
+/* Typography scale（常用档） */
+.title-large {
+  font-size: 22px;
+  font-weight: 400;
+  line-height: 28px;
+}
+
+.title-medium {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 24px;
+}
+
+.body-medium {
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.label-medium {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  letter-spacing: 0.5px;
+}

@@ -10,7 +10,10 @@ namespace BonLivre.Services;
 public partial class LocalBookService
 {
     private readonly string _booksDir;
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, EpubBook> _epubCache = new();
+    // 缓存以 (LastWriteTimeUtc, Length) 做失效判断：books/ 目录下的文件可能被用户替换，
+    // 旧缓存若不失效会一直读到替换前的内容。
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime LastWriteUtc, EpubBook Book)> _epubCache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TxtBookCache> _txtCache = new();
 
     public LocalBookService()
     {
@@ -20,7 +23,75 @@ public partial class LocalBookService
 
     private EpubBook GetOrAddEpub(string filePath)
     {
-        return _epubCache.GetOrAdd(filePath, (path) => EpubReader.ReadBook(path));
+        var lastWrite = File.GetLastWriteTimeUtc(filePath);
+        if (_epubCache.TryGetValue(filePath, out var cached) && cached.LastWriteUtc == lastWrite)
+        {
+            return cached.Book;
+        }
+        var book = EpubReader.ReadBook(filePath);
+        _epubCache[filePath] = (lastWrite, book);
+        return book;
+    }
+
+    /// <summary>TXT 全文与章节切分的缓存条目。目录与正文请求共用，避免每次翻页重读全文、重跑章节正则。</summary>
+    private sealed record TxtBookCache(DateTime LastWriteUtc, long FileLength, string Content, List<TxtChapterSpan> Spans);
+
+    private static TxtBookCache GetOrAddTxt(string filePath)
+    {
+        var info = new FileInfo(filePath);
+        if (_txtCache.TryGetValue(filePath, out var cached) &&
+            cached.LastWriteUtc == info.LastWriteTimeUtc && cached.FileLength == info.Length)
+        {
+            return cached;
+        }
+        var content = ReadTextAutoEncoding(filePath);
+        var entry = new TxtBookCache(info.LastWriteTimeUtc, info.Length, content, BuildTxtChapters(content));
+        _txtCache[filePath] = entry;
+        return entry;
+    }
+
+    // 严格 UTF-8（无 BOM 输出、非法字节抛异常），用于编码探测。
+    private static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+    // GB18030 需要 CodePagesEncodingProvider（Program.cs 启动时注册），懒取一次。
+    private static readonly Lazy<Encoding?> Gb18030 = new(() =>
+    {
+        try
+        {
+            return Encoding.GetEncoding("GB18030",
+                EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+        }
+        catch { return null; }
+    });
+
+    /// <summary>
+    /// 读取文本文件并自动识别编码：先看 BOM（UTF-8/UTF-16LE/BE），无 BOM 时尝试严格 UTF-8
+    /// 解码，失败则按 GB18030（兼容 GBK/GB2312，中文 TXT 最常见的非 UTF-8 编码）解码。
+    /// 都不行时回退宽松 UTF-8，乱码总好过 500。
+    /// </summary>
+    private static string ReadTextAutoEncoding(string filePath)
+    {
+        var bytes = File.ReadAllBytes(filePath);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+
+        try
+        {
+            return StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            var gb = Gb18030.Value;
+            if (gb != null)
+            {
+                try { return gb.GetString(bytes); }
+                catch (DecoderFallbackException) { }
+            }
+            return Encoding.UTF8.GetString(bytes);
+        }
     }
 
     /// <summary>
@@ -59,17 +130,105 @@ public partial class LocalBookService
         {
             var fileName = Path.GetFileNameWithoutExtension(file);
             var isEpub = file.EndsWith(".epub", StringComparison.OrdinalIgnoreCase);
+
+            string name = fileName;
+            string author = isEpub ? "EPUB" : "本地作者";
+            string? intro = "";
+            int totalChapters = 0;
+            string latestChapter = "未更新";
+
+            if (isEpub)
+            {
+                // 优先用 EPUB 元数据里的书名/作者/简介；解析失败回退文件名。
+                try
+                {
+                    var epub = GetOrAddEpub(file);
+                    if (!string.IsNullOrWhiteSpace(epub.Title)) name = epub.Title.Trim();
+                    var epubAuthor = epub.Author;
+                    if (!string.IsNullOrWhiteSpace(epubAuthor)) author = epubAuthor.Trim();
+                    intro = epub.Description;
+                    totalChapters = epub.ReadingOrder.Count;
+                    if (totalChapters > 0)
+                    {
+                        var lastFile = epub.ReadingOrder[totalChapters - 1];
+                        latestChapter = epub.Navigation?.FirstOrDefault(n => n.Link?.ContentFilePath == lastFile.FilePath)?.Title
+                            ?? $"章节 {totalChapters}";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[GetLocalBooks] EPUB metadata error: {file}: {ex.Message}");
+                }
+            }
+            else
+            {
+                // TXT 从文件名提取书名/作者，支持常见命名：《书名》作者、书名 - 作者、书名 作者：xxx。
+                (name, author) = ParseTxtFileName(fileName);
+                try
+                {
+                    var spans = GetOrAddTxt(file).Spans;
+                    totalChapters = spans.Count;
+                    if (spans.Count > 0) latestChapter = spans[^1].Title;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[GetLocalBooks] TXT parse error: {file}: {ex.Message}");
+                }
+            }
+
             var book = new Book(
-                Name: fileName,
-                Author: isEpub ? "EPUB" : "本地作者",
+                Name: name,
+                Author: author,
                 BookUrl: $"local://{Path.GetFileName(file)}",
                 TocUrl: $"local://{Path.GetFileName(file)}",
                 Origin: "local",
-                OriginName: isEpub ? "EPUB" : "本地导入"
+                OriginName: isEpub ? "EPUB" : "本地导入",
+                Intro: intro,
+                TotalChapterNum: totalChapters,
+                LatestChapterTitle: latestChapter
             );
             bookshelf.Add(book);
         }
         return bookshelf;
+    }
+
+    // 《书名》后跟作者；或「书名 - 作者」；或「书名 作者：xxx」。
+    [GeneratedRegex(@"^《(?<name>[^》]+)》\s*(?:作者[：:]\s*)?(?<author>.*)$")]
+    private static partial Regex BracketTitleRegex();
+    [GeneratedRegex(@"^(?<name>.+?)\s*(?:-|—|_)\s*(?:作者[：:]\s*)?(?<author>[^-—_]+)$")]
+    private static partial Regex DashAuthorRegex();
+    [GeneratedRegex(@"^(?<name>.+?)\s+作者[：:]\s*(?<author>.+)$")]
+    private static partial Regex AuthorMarkerRegex();
+
+    /// <summary>
+    /// 从 TXT 文件名（不含扩展名）尽力解析出书名与作者。
+    /// 无法识别时书名取整个文件名、作者回退「本地作者」，与旧行为一致。
+    /// </summary>
+    internal static (string Name, string Author) ParseTxtFileName(string fileName)
+    {
+        fileName = fileName.Trim();
+
+        var m = BracketTitleRegex().Match(fileName);
+        if (m.Success)
+        {
+            var author = m.Groups["author"].Value.Trim();
+            return (m.Groups["name"].Value.Trim(), author.Length > 0 ? author : "本地作者");
+        }
+
+        m = AuthorMarkerRegex().Match(fileName);
+        if (m.Success)
+        {
+            return (m.Groups["name"].Value.Trim(), m.Groups["author"].Value.Trim());
+        }
+
+        m = DashAuthorRegex().Match(fileName);
+        // 「- 作者」式命名里作者通常较短；过长的尾段更可能是副标题，不当作者处理。
+        if (m.Success && m.Groups["author"].Value.Trim().Length <= 12)
+        {
+            return (m.Groups["name"].Value.Trim(), m.Groups["author"].Value.Trim());
+        }
+
+        return (fileName, "本地作者");
     }
 
     public List<BookChapter>? GetChapterList(string url)
@@ -98,8 +257,8 @@ public partial class LocalBookService
             }
         }
 
-        var content = File.ReadAllText(filePath, Encoding.UTF8);
-        var spans = BuildTxtChapters(content);
+        var txt = GetOrAddTxt(filePath);
+        var spans = txt.Spans;
         var chapters = new List<BookChapter>(spans.Count);
         for (int i = 0; i < spans.Count; i++)
         {
@@ -163,12 +322,11 @@ public partial class LocalBookService
             }
         }
 
-        var content = File.ReadAllText(filePath, Encoding.UTF8);
-        var spans = BuildTxtChapters(content);
+        var txt = GetOrAddTxt(filePath);
 
-        if (index < 0 || index >= spans.Count) return null;
+        if (index < 0 || index >= txt.Spans.Count) return null;
 
-        return content.Substring(spans[index].Start, spans[index].Length);
+        return txt.Content.Substring(txt.Spans[index].Start, txt.Spans[index].Length);
     }
 
     /// <summary>TXT 章节切分结果：标题、在原文中的起始偏移与长度，以及是否为分卷标题。</summary>
@@ -379,6 +537,23 @@ public partial class LocalBookService
         };
     }
 
+    /// <summary>按文件头魔数识别图片 MIME 类型，识别不出时回退 image/jpeg。</summary>
+    public static string DetectImageMime(byte[] data)
+    {
+        if (data.Length >= 8 &&
+            data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47)
+            return "image/png";
+        if (data.Length >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+            return "image/jpeg";
+        if (data.Length >= 4 && data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46)
+            return "image/gif";
+        if (data.Length >= 12 &&
+            data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+            data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50)
+            return "image/webp";
+        return "image/jpeg";
+    }
+
     public byte[]? GetEpubCover(string path)
     {
         var filePath = ResolveLocalPath(path);
@@ -395,6 +570,17 @@ public partial class LocalBookService
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// 本地书籍（EPUB 或 TXT）的显示标题，用于生成占位封面：
+    /// EPUB 取元数据标题，TXT 取文件名解析出的书名。
+    /// </summary>
+    public string GetLocalBookTitle(string url)
+    {
+        if (url.EndsWith(".epub", StringComparison.OrdinalIgnoreCase)) return GetEpubTitle(url);
+        var rawName = url.Replace("local://", "").Split('#')[0];
+        return ParseTxtFileName(Path.GetFileNameWithoutExtension(rawName)).Name;
     }
 
     /// <summary>
@@ -484,4 +670,75 @@ public partial class LocalBookService
     private static string EscapeXml(string s) =>
         s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
          .Replace("\"", "&quot;").Replace("'", "&apos;");
+
+    /// <summary>
+    /// 「删除」本地书籍：不硬删，移入 books/.trash/ 回收站（同名时加序号），
+    /// 用户可手动恢复。前端在「搜索书拒绝入库」流程也会调 deleteBook，
+    /// 硬删会让一次误点直接毁掉书籍文件。返回是否实际移动了文件。
+    /// </summary>
+    public bool DeleteLocalBook(string bookUrl)
+    {
+        var filePath = ResolveLocalPath(bookUrl);
+        if (filePath == null || !File.Exists(filePath)) return false;
+
+        var trashDir = Path.Combine(_booksDir, ".trash");
+        Directory.CreateDirectory(trashDir);
+
+        var target = Path.Combine(trashDir, Path.GetFileName(filePath));
+        for (int i = 1; File.Exists(target); i++)
+        {
+            target = Path.Combine(trashDir,
+                $"{Path.GetFileNameWithoutExtension(filePath)}({i}){Path.GetExtension(filePath)}");
+        }
+        File.Move(filePath, target);
+
+        // 让缓存立即失效，避免已删除的书还能翻页。
+        _epubCache.TryRemove(filePath, out _);
+        _txtCache.TryRemove(filePath, out _);
+        Console.WriteLine($"[DeleteLocalBook] moved to trash: {Path.GetFileName(filePath)}");
+        return true;
+    }
+
+    /// <summary>
+    /// 保存上传的书籍文件到 books/。仅接受 .txt/.epub 扩展名，文件名剥离目录部分防穿越；
+    /// 目标已存在且未指定覆盖时返回失败。返回 (是否成功, 消息, 新书 BookUrl)。
+    /// </summary>
+    public async Task<(bool Ok, string Message, string BookUrl)> SaveUploadedBookAsync(
+        string fileName, Stream content, bool overwrite)
+    {
+        fileName = Path.GetFileName(fileName.Trim());
+        if (string.IsNullOrEmpty(fileName)) return (false, "缺少文件名", "");
+
+        var ext = Path.GetExtension(fileName);
+        if (!ext.Equals(".txt", StringComparison.OrdinalIgnoreCase) &&
+            !ext.Equals(".epub", StringComparison.OrdinalIgnoreCase))
+        {
+            return (false, "仅支持 .txt 与 .epub 文件", "");
+        }
+
+        var bookUrl = $"local://{fileName}";
+        var filePath = ResolveLocalPath(bookUrl);
+        if (filePath == null) return (false, "非法文件名", "");
+        if (File.Exists(filePath) && !overwrite) return (false, "同名书籍已存在（可用 overwrite=true 覆盖）", "");
+
+        // 先写临时文件再原子替换，避免写一半的文件被当成书籍扫描出来。
+        var tmpPath = filePath + ".uploading";
+        try
+        {
+            await using (var fs = File.Create(tmpPath))
+            {
+                await content.CopyToAsync(fs);
+            }
+            File.Move(tmpPath, filePath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tmpPath)) File.Delete(tmpPath);
+        }
+
+        _epubCache.TryRemove(filePath, out _);
+        _txtCache.TryRemove(filePath, out _);
+        Console.WriteLine($"[UploadBook] saved: {fileName}");
+        return (true, "", bookUrl);
+    }
 }

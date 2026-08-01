@@ -55,6 +55,17 @@
               {{ connectStatus }}
             </el-tag>
           </div>
+          <div class="setting-item">
+            <el-tag
+              type="info"
+              size="large"
+              class="setting-connect"
+              :class="{ 'no-point': uploading }"
+              @click="pickBookFiles"
+            >
+              {{ uploading ? '导入中…' : '导入书籍' }}
+            </el-tag>
+          </div>
         </div>
       </div>
       <div class="bottom-icons">
@@ -102,10 +113,15 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="connectDialogVisible = false" :disabled="connectLoading"
+        <el-button
+          @click="connectDialogVisible = false"
+          :disabled="connectLoading"
           >取消</el-button
         >
-        <el-button type="primary" :loading="connectLoading" @click="submitConnect"
+        <el-button
+          type="primary"
+          :loading="connectLoading"
+          @click="submitConnect"
           >{{ connectLoading ? '校验中…' : '确定' }}</el-button
         >
       </template>
@@ -272,6 +288,47 @@ const submitConnect = async () => {
   } finally {
     connectLoading.value = false
   }
+}
+
+// 导入本地书籍：选取 .txt/.epub 上传到后端 books/ 目录，成功后刷新书架
+const uploading = ref(false)
+const pickBookFiles = () => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.txt,.epub'
+  input.multiple = true
+  input.onchange = async () => {
+    const files = Array.from(input.files ?? [])
+    if (files.length === 0) return
+    uploading.value = true
+    try {
+      const { data } = await API.uploadBook(files)
+      if (!data.isSuccess) {
+        // 同名冲突等失败：询问是否覆盖后重试
+        await ElMessageBox.confirm(
+          `${data.errorMsg}，是否覆盖导入？`,
+          '导入书籍',
+          {
+            confirmButtonText: '覆盖',
+            cancelButtonText: '取消',
+          },
+        )
+        const retry = await API.uploadBook(files, true)
+        if (!retry.data.isSuccess) {
+          ElMessage.error(retry.data.errorMsg)
+          return
+        }
+      }
+      ElMessage.success(`成功导入 ${files.length} 本书籍`)
+      await store.loadBookShelf()
+    } catch (e) {
+      // ElMessageBox 取消会 reject 'cancel'，静默即可；其余为网络错误
+      if (e !== 'cancel') ElMessage.error('导入失败，请检查网络与后端状态')
+    } finally {
+      uploading.value = false
+    }
+  }
+  input.click()
 }
 
 const router = useRouter()

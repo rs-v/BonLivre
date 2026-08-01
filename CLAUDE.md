@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-BonLivre is a .NET 10 backend that reimplements the HTTP/WebSocket API of the [legado (阅读)](https://github.com/gedoor/legado) reader app, paired with legado's Vue 3 web frontend (originally targeting an Android app's embedded WebView). The backend serves local EPUB/TXT files from the `books/` directory as if they were legado book sources, so the unmodified frontend can browse, read, and track progress against it.
+BonLivre is a .NET 10 backend that reimplements the HTTP/WebSocket API of the [legado (阅读)](https://github.com/gedoor/legado) reader app, paired with a Svelte 5 web frontend in `web-svelte/` (the **active** frontend, built and bundled on publish). The backend serves local EPUB/TXT files from the `books/` directory as if they were legado book sources, so the frontend can browse, read, and track progress against it.
+
+`web/` contains the previous Vue 3 frontend (legado's web project, kept for reference/rollback). It is no longer built by `dotnet publish` or CI.
 
 ## Commands
 
@@ -17,14 +19,12 @@ dotnet format --verify-no-changes   # format check (CI runs this)
 dotnet publish -c Release           # Native AOT publish
 ```
 
-Frontend (run from `web/`, requires Node >= 20, pnpm >= 9):
+Frontend (run from `web-svelte/`, requires Node >= 20, pnpm >= 9):
 ```bash
 pnpm install
-pnpm dev            # dev server on http://localhost:8080
-pnpm build          # type-check + build, then runs scripts/sync.js
-pnpm type-check     # vue-tsc
-pnpm lint:fix       # eslint --fix
-pnpm format         # prettier
+pnpm dev            # dev server on http://localhost:8080 (backend assumed at :5000)
+pnpm build          # vite build → dist/
+pnpm check          # svelte-check (CI runs this)
 ```
 
 There is no test suite in this repo.
@@ -50,17 +50,18 @@ Local books use a `local://<filename>` URL. The fragment encodes chapter locatio
 - EPUB: `local://file.epub#epub#<internal/file/path.html>` — the part after `#epub#` is the reading-order file path.
 - TXT: `local://file.txt#<index>` — index into regex-detected chapter matches; a book with no detected chapters is served as a single "正文" chapter.
 
-## Frontend architecture
+## Frontend architecture (`web-svelte/`)
 
-Vite + Vue 3 (Composition API) + Pinia + Vue Router (hash history) + Element Plus. It is legado's `web/` project largely unchanged.
+Vite + Svelte 5 (runes) + TypeScript. No component library, no external router/store — plain CSS, a hash router in `src/lib/router.svelte.ts`, and rune-based shared state (`.svelte.ts` modules).
 
-- `pnpm build` runs `scripts/sync.js`, which copies `dist/` into `../../../app/src/main/assets/web/vue` — **only when `GITHUB_ENV` is set** (CI/the legado Android repo). It no-ops locally, so a plain local build is safe.
-- API layer: `src/api/api.ts` defines all backend calls; `src/api/axios.ts` sets `baseURL` from `VITE_API` env, then `localStorage['remoteUrl']`, then `location.origin`. Field names must match the backend's camelCase records.
-- Auto-imports: `vite.config.ts` auto-imports Vue/Router/Pinia APIs and everything under `src/components` and `src/store`, plus Element Plus components. Do not add manual imports for these — `src/auto-imports.d.ts` and `src/components.d.ts` are generated. Path aliases: `@` → `src`, `@api` → `src/api`.
-- Routes (hash-based): `/` bookshelf, `/#/bookSource` book-source editor, `/#/rssSource` rss-source editor. `api.ts` branches on whether the URL contains `bookSource` to hit book vs. rss endpoints — several of those rss/source endpoints are frontend expectations the backend does not yet implement.
+- `src/lib/api.ts` — all backend calls via `fetch`. Base URL from `localStorage['remoteUrl']`, else `location.origin` (dev: same host, port 5000). Password from `localStorage['remotePassword']`: HTTP requests use `Authorization: Bearer`, while WebSocket/`<img src>`/sendBeacon append `?password=`. Field names must match the backend's camelCase records (`src/lib/types.ts`).
+- `src/lib/reader.svelte.ts` — reading session state (current book, catalog, chapterIndex/chapterPos) plus progress saving (sendBeacon, 60s throttle) and read-config load/save via `/getReadConfig`/`/saveReadConfig`.
+- Views: `src/views/Bookshelf.svelte` (shelf grid, local filter + WS online search, connect dialog, upload, delete) and `src/views/Reader.svelte` (catalog drawer, content with EPUB image proxy, chapterPos tracking via IntersectionObserver, themes/font-size/width settings).
+- Routes (hash-based): `/` bookshelf, `/#/chapter` reader. There is no source-editor UI — the backend only stubs those endpoints anyway.
+- `chapterPos` semantics (compatible with legado web): cumulative character count of paragraphs read, +1 per paragraph for the newline.
 
 ## Notes
 
-- The frontend expects the full legado API surface; the backend implements the subset needed for local-file reading and stubs the rest (e.g. `saveBookSource` returns success without persisting, `getChapterList`/`getBookContent` return mock data for non-`local://` URLs). When wiring new frontend features, check whether the endpoint actually exists in `Endpoints/`.
+- The backend implements the subset of the legado API needed for local-file reading and stubs the rest (e.g. `saveBookSource` returns success without persisting, `getChapterList`/`getBookContent` return mock data for non-`local://` URLs). When wiring new frontend features, check whether the endpoint actually exists in `Endpoints/`.
 - No authentication exists on any endpoint and CORS is fully open — intended for local/trusted-network use.
 - `books/` (`.txt`) and `data/` (`.sqlite`) contents are gitignored.

@@ -32,8 +32,8 @@ public static class PasswordAuth
         {
             var path = context.Request.Path;
 
-            // 放行 CORS 预检（否则跨域请求会被拦截）与根路径存活探测
-            if (HttpMethods.IsOptions(context.Request.Method) || path == "/")
+            // 放行 CORS 预检（否则跨域请求会被拦截）、根路径与 /health 存活探测
+            if (HttpMethods.IsOptions(context.Request.Method) || path == "/" || path == "/health")
             {
                 await next();
                 return;

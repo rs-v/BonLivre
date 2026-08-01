@@ -52,27 +52,22 @@ jobs:
         version: 9
 
     - name: Install dependencies
-      working-directory: ./web
+      working-directory: ./web-svelte
       run: pnpm install
 
-    - name: Type check
-      working-directory: ./web
-      run: pnpm run type-check
-
-    - name: Lint
-      working-directory: ./web
-      run: npx eslint .
-      continue-on-error: true
+    - name: Check (svelte-check)
+      working-directory: ./web-svelte
+      run: pnpm run check
 
     - name: Build
-      working-directory: ./web
+      working-directory: ./web-svelte
       run: pnpm run build
 
     - name: Upload frontend artifact
       uses: actions/upload-artifact@v4
       with:
         name: frontend-build
-        path: ./web/dist
+        path: ./web-svelte/dist
         retention-days: 7
 
   package:
