@@ -14,6 +14,14 @@ public partial class LocalBookService
     // 旧缓存若不失效会一直读到替换前的内容。
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime LastWriteUtc, EpubBook Book)> _epubCache = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TxtBookCache> _txtCache = new();
+    private readonly Dictionary<string, UploadLock> _uploadLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _uploadLocksLock = new();
+
+    private sealed class UploadLock
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public int ReferenceCount { get; set; }
+    }
 
     public LocalBookService()
     {
@@ -778,26 +786,66 @@ public partial class LocalBookService
         var bookUrl = $"local://{fileName}";
         var filePath = ResolveLocalPath(bookUrl);
         if (filePath == null) return (false, "非法文件名", "");
-        if (File.Exists(filePath) && !overwrite) return (false, "同名书籍已存在（可用 overwrite=true 覆盖）", "");
 
-        // 先写临时文件再原子替换，避免写一半的文件被当成书籍扫描出来。
-        var tmpPath = filePath + ".uploading";
+        var uploadLock = AcquireUploadLock(filePath);
+        await uploadLock.Gate.WaitAsync();
         try
         {
-            await using (var fs = File.Create(tmpPath))
+            // 在同名上传串行锁内检查，避免两个非覆盖请求同时通过检查。
+            if (File.Exists(filePath) && !overwrite)
+                return (false, "同名书籍已存在（可用 overwrite=true 覆盖）", "");
+
+            // 临时文件必须唯一且与目标同目录：既避免并发相互覆盖，又保证移动在同一文件系统内。
+            var tmpPath = $"{filePath}.{Guid.NewGuid():N}.uploading";
+            try
             {
-                await content.CopyToAsync(fs);
+                await using (var fs = File.Create(tmpPath))
+                {
+                    await content.CopyToAsync(fs);
+                }
+                File.Move(tmpPath, filePath, overwrite: true);
             }
-            File.Move(tmpPath, filePath, overwrite: true);
+            finally
+            {
+                if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            }
+
+            _epubCache.TryRemove(filePath, out _);
+            _txtCache.TryRemove(filePath, out _);
+            Console.WriteLine($"[UploadBook] saved: {fileName}");
+            return (true, "", bookUrl);
         }
         finally
         {
-            if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            uploadLock.Gate.Release();
+            ReleaseUploadLock(filePath, uploadLock);
         }
+    }
 
-        _epubCache.TryRemove(filePath, out _);
-        _txtCache.TryRemove(filePath, out _);
-        Console.WriteLine($"[UploadBook] saved: {fileName}");
-        return (true, "", bookUrl);
+    private UploadLock AcquireUploadLock(string filePath)
+    {
+        lock (_uploadLocksLock)
+        {
+            if (!_uploadLocks.TryGetValue(filePath, out var uploadLock))
+            {
+                uploadLock = new UploadLock();
+                _uploadLocks.Add(filePath, uploadLock);
+            }
+            uploadLock.ReferenceCount++;
+            return uploadLock;
+        }
+    }
+
+    private void ReleaseUploadLock(string filePath, UploadLock uploadLock)
+    {
+        lock (_uploadLocksLock)
+        {
+            uploadLock.ReferenceCount--;
+            if (uploadLock.ReferenceCount == 0)
+            {
+                _uploadLocks.Remove(filePath);
+                uploadLock.Gate.Dispose();
+            }
+        }
     }
 }

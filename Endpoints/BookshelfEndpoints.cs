@@ -15,6 +15,7 @@ public static class BookshelfEndpoints
     private static readonly object _bookshelfLock = new();
 
     private const string ReadConfigKey = "readConfig";
+    private const int MaxUploadFilesPerRequest = 10;
 
     public static void MapBookshelfEndpoints(this IEndpointRouteBuilder app)
     {
@@ -294,6 +295,12 @@ public static class BookshelfEndpoints
                 if (form.Files.Count == 0)
                 {
                     return Results.Json(new LeagdoApiResponse<string>(false, "未收到文件", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+                if (form.Files.Count > MaxUploadFilesPerRequest)
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<string>(false, $"单次最多上传 {MaxUploadFilesPerRequest} 个文件", ""),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseString);
                 }
 
                 var saved = new List<string>();
