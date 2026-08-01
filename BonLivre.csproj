@@ -7,17 +7,25 @@
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!--
-      web/ 是前端源码目录。Web SDK 默认会把项目下的 **/*.json、**/*.ts 等当作
+      web-svelte/ 是前端源码目录。Web SDK 默认会把项目下的 **/*.json、**/*.ts 等当作
       Content 打进产物，导致前端的 package.json、tsconfig*.json 混入发布目录。
-      整个排除前端目录，前端产物由下方 target 显式注入。
+      排除前端目录，前端产物由下方 target 显式注入。
     -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);web\**;web-svelte\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);web-svelte\**;books\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <!-- 发布包以体积优先；Release 产物不携带原生调试符号。 -->
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <StripSymbols>true</StripSymbols>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
     <PackageReference Include="VersOne.Epub" Version="3.3.4" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
+    <PackageReference Include="LiteDB" Version="5.0.21" />
   </ItemGroup>
 
   <!--
@@ -26,7 +34,7 @@
 
     实现要点：wwwroot/**  的静态资源 glob 发生在 MSBuild 求值期（任何 target 运行前），
     那时前端还没构建，无法依赖它。因此这里 hook 到 ComputeFilesToPublish 之前，
-    先构建前端，再把 web/dist/** 直接作为 ResolvedFileToPublish 注入发布文件列表，
+    先构建前端，再把 web-svelte/dist/** 直接作为 ResolvedFileToPublish 注入发布文件列表，
     目标相对路径设为 wwwroot/…，绕开求值期 glob 的时序问题。
   -->
   <Target Name="BuildFrontend" BeforeTargets="ComputeFilesToPublish" Condition="'$(SkipFrontend)' != 'true'">

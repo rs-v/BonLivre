@@ -1,6 +1,7 @@
 using System.Text;
 using BonLivre.Endpoints;
 using BonLivre.Configuration;
+using BonLivre.Services;
 
 // 注册 GBK/GB18030 等代码页编码，供 LocalBookService 读取非 UTF-8 的中文 TXT。
 Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
@@ -36,6 +37,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
 });
+
+builder.Services.AddSingleton<LiteDbStore>();
 
 var app = builder.Build();
 

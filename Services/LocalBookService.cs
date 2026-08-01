@@ -277,43 +277,12 @@ public partial class LocalBookService
             try
             {
                 var epubParts = url.Split("#epub#", StringSplitOptions.RemoveEmptyEntries);
-                string? targetFile = epubParts.Length > 1 ? epubParts[1] : null;
-
-                EpubBook book = GetOrAddEpub(filePath);
-                string? htmlContent = null;
-                if (targetFile != null)
-                {
-                    var foundFile = book.ReadingOrder.FirstOrDefault(f => f.FilePath == targetFile);
-                    if (foundFile != null) htmlContent = foundFile.Content;
-                }
-                else if (index >= 0 && index < book.ReadingOrder.Count)
-                {
-                    htmlContent = book.ReadingOrder[index].Content;
-                }
-
-                if (!string.IsNullOrEmpty(htmlContent))
-                {
-                    var doc = new HtmlDocument();
-                    doc.LoadHtml(htmlContent);
-                    doc.DocumentNode.Descendants("script").ToList().ForEach(n => n.Remove());
-                    doc.DocumentNode.Descendants("style").ToList().ForEach(n => n.Remove());
-
-                    // 获取当前 HTML 文件的目录路径，用于解析图片的相对路径
-                    string currentDir = "";
-                    if (targetFile != null)
-                    {
-                        currentDir = Path.GetDirectoryName(targetFile) ?? "";
-                    }
-                    else if (index >= 0 && index < book.ReadingOrder.Count)
-                    {
-                        currentDir = Path.GetDirectoryName(book.ReadingOrder[index].FilePath) ?? "";
-                    }
-                    currentDir = currentDir.Replace("\\", "/");
-
-                    var sb = new StringBuilder();
-                    ExtractTextWithImages(doc.DocumentNode, sb, currentDir);
-                    return HtmlEntity.DeEntitize(sb.ToString());
-                }
+                var targetFile = epubParts.Length > 1 ? epubParts[1] : null;
+                var book = GetOrAddEpub(filePath);
+                var textFile = targetFile == null
+                    ? index >= 0 && index < book.ReadingOrder.Count ? book.ReadingOrder[index] : null
+                    : book.ReadingOrder.FirstOrDefault(file => file.FilePath == targetFile);
+                return textFile == null ? null : ExtractEpubChapterText(textFile.Content, textFile.FilePath);
             }
             catch (Exception ex)
             {
@@ -323,10 +292,100 @@ public partial class LocalBookService
         }
 
         var txt = GetOrAddTxt(filePath);
-
         if (index < 0 || index >= txt.Spans.Count) return null;
-
         return txt.Content.Substring(txt.Spans[index].Start, txt.Spans[index].Length);
+    }
+
+    /// <summary>搜索本地书籍已渲染的正文，返回可直接用于阅读器跳转的章内位置。</summary>
+    public List<BookContentSearchResult>? SearchBookContent(string url, string key, int maxResults)
+    {
+        var filePath = ResolveLocalPath(url);
+        if (filePath == null || !File.Exists(filePath)) return null;
+
+        try
+        {
+            var results = new List<BookContentSearchResult>();
+            if (filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+            {
+                var book = GetOrAddEpub(filePath);
+                for (var index = 0; index < book.ReadingOrder.Count && results.Count < maxResults; index++)
+                {
+                    var textFile = book.ReadingOrder[index];
+                    var title = book.Navigation?.FirstOrDefault(node => node.Link?.ContentFilePath == textFile.FilePath)?.Title
+                        ?? $"章节 {index + 1}";
+                    AddChapterMatches(results, index, title,
+                        ExtractEpubChapterText(textFile.Content, textFile.FilePath), key, maxResults);
+                }
+                return results;
+            }
+
+            if (!filePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return null;
+            var txt = GetOrAddTxt(filePath);
+            for (var index = 0; index < txt.Spans.Count && results.Count < maxResults; index++)
+            {
+                var span = txt.Spans[index];
+                AddChapterMatches(results, index, span.Title,
+                    txt.Content.Substring(span.Start, span.Length), key, maxResults);
+            }
+            return results;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Book content search error: {ex.Message}");
+            return null;
+        }
+    }
+
+    private string ExtractEpubChapterText(string? htmlContent, string filePath)
+    {
+        if (string.IsNullOrEmpty(htmlContent)) return "";
+        var doc = new HtmlDocument();
+        doc.LoadHtml(htmlContent);
+        doc.DocumentNode.Descendants("script").ToList().ForEach(node => node.Remove());
+        doc.DocumentNode.Descendants("style").ToList().ForEach(node => node.Remove());
+
+        var currentDir = (Path.GetDirectoryName(filePath) ?? "").Replace("\\", "/");
+        var sb = new StringBuilder();
+        ExtractTextWithImages(doc.DocumentNode, sb, currentDir);
+        return HtmlEntity.DeEntitize(sb.ToString());
+    }
+
+    private static void AddChapterMatches(
+        List<BookContentSearchResult> results, int chapterIndex, string chapterTitle,
+        string content, string key, int maxResults)
+    {
+        var position = -1;
+        foreach (var rawLine in content.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0) continue;
+
+            position += line.Length + 1;
+            if (IsImageMarker(line)) continue;
+
+            var start = 0;
+            while (results.Count < maxResults)
+            {
+                var matchIndex = line.IndexOf(key, start, StringComparison.OrdinalIgnoreCase);
+                if (matchIndex < 0) break;
+
+                results.Add(new BookContentSearchResult(
+                    chapterIndex, chapterTitle, position, CreateSnippet(line, matchIndex, key.Length)));
+                start = matchIndex + Math.Max(key.Length, 1);
+            }
+            if (results.Count >= maxResults) return;
+        }
+    }
+
+    private static bool IsImageMarker(string line) =>
+        line.StartsWith("<img src=\"", StringComparison.Ordinal) && line.EndsWith("\">", StringComparison.Ordinal);
+
+    private static string CreateSnippet(string line, int matchIndex, int matchLength)
+    {
+        const int contextLength = 36;
+        var start = Math.Max(0, matchIndex - contextLength);
+        var end = Math.Min(line.Length, matchIndex + matchLength + contextLength);
+        return $"{(start > 0 ? "…" : "")}{line[start..end]}{(end < line.Length ? "…" : "")}";
     }
 
     /// <summary>TXT 章节切分结果：标题、在原文中的起始偏移与长度，以及是否为分卷标题。</summary>

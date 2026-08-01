@@ -1,4 +1,4 @@
-import type { Book, BookChapter, BookProgress, ReadConfig } from './types'
+import type { Bookmark, Book, BookChapter, BookProgress, ReadConfig } from './types'
 import { defaultReadConfig } from './types'
 import * as api from './api'
 
@@ -17,6 +17,9 @@ export const reading = $state<{
   config: { ...defaultReadConfig, spacing: { ...defaultReadConfig.spacing } },
 })
 
+/** 当前书籍的持久化书签，按创建时间倒序排列。 */
+export const bookmarks = $state<{ items: Bookmark[] }>({ items: [] })
+
 const READING_KEY = 'readingBook'
 
 /** 进入阅读器前调用：记录书籍并持久化，刷新后仍能恢复 */
@@ -24,6 +27,7 @@ export const startReading = (book: Book) => {
   reading.book = book
   reading.chapterIndex = book.durChapterIndex ?? 0
   reading.chapterPos = book.durChapterPos ?? 0
+  bookmarks.items = []
   localStorage.setItem(READING_KEY, JSON.stringify(book))
 }
 
@@ -48,6 +52,59 @@ export const restoreReading = (): boolean => {
     return true
   } catch {
     return false
+  }
+}
+
+export const loadBookmarks = async (): Promise<string | null> => {
+  const bookUrl = reading.book?.bookUrl
+  if (!bookUrl) {
+    bookmarks.items = []
+    return null
+  }
+
+  try {
+    const resp = await api.getBookmarks(bookUrl)
+    if (reading.book?.bookUrl !== bookUrl) return null
+    if (!resp.isSuccess) return resp.errorMsg || '获取书签失败'
+    bookmarks.items = resp.data
+    return null
+  } catch {
+    return '获取书签失败'
+  }
+}
+
+export const createCurrentBookmark = async (): Promise<string | null> => {
+  const book = reading.book
+  if (!book) return '未找到当前书籍'
+
+  const { chapterIndex, chapterPos } = reading
+  if (bookmarks.items.some(b => b.chapterIndex === chapterIndex && b.chapterPos === chapterPos)) {
+    return '当前位置已有书签'
+  }
+
+  try {
+    const resp = await api.createBookmark({
+      bookUrl: book.bookUrl,
+      chapterIndex,
+      chapterPos,
+    })
+    if (!resp.isSuccess) return resp.errorMsg || '添加书签失败'
+    if (reading.book?.bookUrl === book.bookUrl)
+      bookmarks.items = [resp.data, ...bookmarks.items]
+    return null
+  } catch {
+    return '添加书签失败'
+  }
+}
+
+export const removeBookmark = async (bookmark: Bookmark): Promise<string | null> => {
+  try {
+    const resp = await api.deleteBookmark({ bookUrl: bookmark.bookUrl, id: bookmark.id })
+    if (!resp.isSuccess) return resp.errorMsg || '删除书签失败'
+    bookmarks.items = bookmarks.items.filter(item => item.id !== bookmark.id)
+    return null
+  } catch {
+    return '删除书签失败'
   }
 }
 

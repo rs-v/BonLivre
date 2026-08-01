@@ -23,8 +23,10 @@ public static class BookshelfEndpoints
         {
             _bookshelf = localService.GetLocalBooks();
         }
-        var progressStore = new BookProgressStore();
-        var settingsStore = new SettingsStore();
+        var database = app.ServiceProvider.GetRequiredService<LiteDbStore>();
+        var progressStore = new BookProgressStore(database);
+        var bookmarkStore = new BookmarkStore(database);
+        var settingsStore = new SettingsStore(database);
 
         app.MapGet("/getReadConfig", () =>
         {
@@ -70,6 +72,112 @@ public static class BookshelfEndpoints
                 Console.WriteLine($"[saveBookProgress Error]: {ex}");
                 return Results.Json(
                     new LeagdoApiResponse<string>(false, "保存进度失败", ""),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+        });
+
+        app.MapGet("/getBookmarks", (string? bookUrl) =>
+        {
+            if (string.IsNullOrWhiteSpace(bookUrl))
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<Bookmark>>(false, "缺少书籍地址", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+            }
+
+            var bookmarks = bookmarkStore.GetByBookUrl(bookUrl);
+            return Results.Json(
+                new LeagdoApiResponse<List<Bookmark>>(true, "", bookmarks),
+                AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+        });
+
+        app.MapPost("/createBookmark", async (HttpRequest request) =>
+        {
+            try
+            {
+                var bookmarkRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.CreateBookmarkRequest,
+                    request.HttpContext.RequestAborted);
+                if (bookmarkRequest == null ||
+                    string.IsNullOrWhiteSpace(bookmarkRequest.BookUrl) ||
+                    bookmarkRequest.ChapterIndex < 0 ||
+                    bookmarkRequest.ChapterPos < 0)
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<Bookmark>(false, "书签位置无效", new Bookmark(0, "", 0, 0, 0)),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseBookmark);
+                }
+
+                var bookmark = bookmarkStore.Create(
+                    bookmarkRequest.BookUrl,
+                    bookmarkRequest.ChapterIndex,
+                    bookmarkRequest.ChapterPos);
+                if (bookmark == null)
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<Bookmark>(false, "当前位置已有书签", new Bookmark(0, "", 0, 0, 0)),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseBookmark);
+                }
+
+                return Results.Json(
+                    new LeagdoApiResponse<Bookmark>(true, "", bookmark),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseBookmark);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<Bookmark>(false, "请求已取消", new Bookmark(0, "", 0, 0, 0)),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseBookmark);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[createBookmark Error]: {ex}");
+                return Results.Json(
+                    new LeagdoApiResponse<Bookmark>(false, "添加书签失败", new Bookmark(0, "", 0, 0, 0)),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseBookmark);
+            }
+        });
+
+        app.MapPost("/deleteBookmark", async (HttpRequest request) =>
+        {
+            try
+            {
+                var bookmarkRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.DeleteBookmarkRequest,
+                    request.HttpContext.RequestAborted);
+                if (bookmarkRequest == null ||
+                    string.IsNullOrWhiteSpace(bookmarkRequest.BookUrl) ||
+                    bookmarkRequest.Id <= 0)
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<string>(false, "书签无效", ""),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+
+                if (!bookmarkStore.Delete(bookmarkRequest.BookUrl, bookmarkRequest.Id))
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<string>(false, "书签不存在或已删除", ""),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                }
+
+                return Results.Json(
+                    new LeagdoApiResponse<string>(true, "", ""),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<string>(false, "请求已取消", ""),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[deleteBookmark Error]: {ex}");
+                return Results.Json(
+                    new LeagdoApiResponse<string>(false, "删除书签失败", ""),
                     AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
         });
@@ -211,6 +319,42 @@ public static class BookshelfEndpoints
                 Console.WriteLine($"[uploadBook Error]: {ex}");
                 return Results.Json(new LeagdoApiResponse<string>(false, "保存上传文件失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
+        });
+
+        app.MapGet("/searchBookContent", (string? url, string? key) =>
+        {
+            if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("local://", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "仅支持搜索本地书籍", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+
+            key = key?.Trim();
+            if (string.IsNullOrEmpty(key))
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "请输入搜索内容", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+            if (key.Length > 100)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "搜索内容不能超过 100 个字符", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+
+            const int maxResults = 100;
+            var results = localService.SearchBookContent(url, key, maxResults);
+            if (results == null)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "搜索书籍内容失败", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+            return Results.Json(
+                new LeagdoApiResponse<List<BookContentSearchResult>>(true, "", results),
+                AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
         });
 
         app.MapGet("/getChapterList", (string url) =>

@@ -1,4 +1,4 @@
-/** 阅读主题：序号与旧 Vue 前端（legado web）保持一致，6 为夜间 */
+/** 阅读主题：序号为持久化阅读配置的一部分，6 为夜间 */
 export type ReaderTheme = {
   name: string
   body: string

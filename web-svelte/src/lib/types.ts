@@ -37,6 +37,13 @@ export type BookChapter = {
   isVolume: boolean
 }
 
+export type BookContentSearchResult = {
+  chapterIndex: number
+  chapterTitle: string
+  chapterPos: number
+  snippet: string
+}
+
 export type BookProgress = {
   name: string
   author: string
@@ -47,6 +54,25 @@ export type BookProgress = {
   durChapterTitle: string
 }
 
+export type Bookmark = {
+  id: number
+  bookUrl: string
+  chapterIndex: number
+  chapterPos: number
+  createdAt: number
+}
+
+export type CreateBookmarkRequest = {
+  bookUrl: string
+  chapterIndex: number
+  chapterPos: number
+}
+
+export type DeleteBookmarkRequest = {
+  bookUrl: string
+  id: number
+}
+
 export type ApiResponse<T> = {
   isSuccess: boolean
   errorMsg: string
@@ -55,7 +81,7 @@ export type ApiResponse<T> = {
 
 /**
  * 阅读界面配置，经 /saveReadConfig 持久化到后端。
- * 结构与旧 Vue 前端（legado web）完全一致，两版前端可共用同一份后端配置：
+ * 字段结构与后端持久化的阅读配置保持一致：
  * font：预置字体序号，-1 表示使用 customFontName；
  * spacing：字距/段距以 em 计，行距为 line-height = 1 + line。
  */

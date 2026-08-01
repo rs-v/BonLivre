@@ -52,4 +52,10 @@
       transform: translateY(0);
     }
   }
+
+  @media (max-width: 750px) {
+    .snackbar-container {
+      bottom: calc(120px + env(safe-area-inset-bottom, 0px));
+    }
+  }
 </style>

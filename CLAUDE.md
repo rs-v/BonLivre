@@ -6,8 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BonLivre is a .NET 10 backend that reimplements the HTTP/WebSocket API of the [legado (阅读)](https://github.com/gedoor/legado) reader app, paired with a Svelte 5 web frontend in `web-svelte/` (the **active** frontend, built and bundled on publish). The backend serves local EPUB/TXT files from the `books/` directory as if they were legado book sources, so the frontend can browse, read, and track progress against it.
 
-`web/` contains the previous Vue 3 frontend (legado's web project, kept for reference/rollback). It is no longer built by `dotnet publish` or CI.
-
 ## Commands
 
 Backend (run from repo root):
@@ -37,11 +35,12 @@ There is no test suite in this repo.
 
 - `Program.cs` — entry point. Configures CORS (AllowAll), WebSockets, static files, camelCase JSON with the AOT context, then calls the `Map*Endpoints` extension methods. Minimal API only, no controllers.
 - `Endpoints/` — each file is a `static class` with a `Map...Endpoints(this IEndpointRouteBuilder)` extension registering routes inline.
-  - `BookshelfEndpoints.cs` — book listing, chapter list, content, cover/image serving, read config, progress. Holds the bookshelf and read config in **static in-memory fields** (`_bookshelf`, `_readConfig`), so they reset on restart; only reading progress is persisted.
+  - `BookshelfEndpoints.cs` — book listing, chapter list, content, cover/image serving, read config, progress, and bookmarks. Holds the bookshelf in a **static in-memory field** (`_bookshelf`), so it resets on restart; reading progress, read config, and bookmarks are persisted.
   - `SourceEndpoints.cs` — book-source stubs plus the `/searchBook` WebSocket, which searches local books by name/author and streams `SearchBook` results as JSON.
 - `Services/`
   - `LocalBookService.cs` — the core. Scans `books/` for `.txt`/`.epub`, parses TXT chapters by Chinese chapter-heading regex, reads EPUB via VersOne.Epub (cached in a static `ConcurrentDictionary`), and rewrites EPUB image `src` to absolute in-archive paths. `GetEpubResource` resolves image requests against the archive with several fuzzy path-matching fallbacks.
-  - `BookProgressStore.cs` — SQLite (`data/bookprogress.sqlite`, auto-created) keyed by `(Name, Author)`, upsert on save. `GetBookshelf` merges stored progress into the in-memory book list.
+  - `LiteDbStore.cs` — application-lifetime LiteDB owner for `data/bonlivre.db`.
+  - `BookProgressStore.cs`, `BookmarkStore.cs`, `SettingsStore.cs` — LiteDB collections for persisted progress, bookmarks, and read settings. Progress is keyed by `BookUrl`; `GetBookshelf` merges it into the in-memory book list.
 - `Models/Models.cs` — all records in one file (`Book`, `BookProgress`, `BookChapter`, `SearchBook`, `LeagdoApiResponse<T>`, etc.).
 
 ### URL scheme for local books
@@ -64,4 +63,4 @@ Vite + Svelte 5 (runes) + TypeScript. No component library, no external router/s
 
 - The backend implements the subset of the legado API needed for local-file reading and stubs the rest (e.g. `saveBookSource` returns success without persisting, `getChapterList`/`getBookContent` return mock data for non-`local://` URLs). When wiring new frontend features, check whether the endpoint actually exists in `Endpoints/`.
 - No authentication exists on any endpoint and CORS is fully open — intended for local/trusted-network use.
-- `books/` (`.txt`) and `data/` (`.sqlite`) contents are gitignored.
+- `books/` (`.txt`) and `data/` (`bonlivre.db`) contents are gitignored. Changing from SQLite to LiteDB starts with fresh persisted data; legacy `.sqlite` files are not imported.

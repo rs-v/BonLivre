@@ -4,11 +4,16 @@
   import { navigate } from '../lib/router.svelte'
   import {
     reading,
+    bookmarks,
     restoreReading,
     saveProgress,
     saveConfig,
     loadConfig,
+    loadBookmarks,
+    createCurrentBookmark,
+    removeBookmark,
   } from '../lib/reader.svelte'
+  import type { BookContentSearchResult } from '../lib/types'
   import {
     themes,
     themeAt,
@@ -19,18 +24,31 @@
 
   type Paragraph = { text: string; img?: string; endPos: number }
   type LoadedChapter = { index: number; title: string; paragraphs: Paragraph[] }
+  type DrawerTab = 'catalog' | 'bookmarks'
 
   // 已加载章节列表：无限加载模式下会持续追加；普通模式始终只有一个元素
   let chapters = $state<LoadedChapter[]>([])
   let contentLoading = $state(true)
   let loadingMore = false
   let catalogOpen = $state(false)
+  let drawerTab = $state<DrawerTab>('catalog')
   let settingsOpen = $state(false)
+  let contentSearchOpen = $state(false)
+  let contentSearchKey = $state('')
+  let contentSearchResults = $state<BookContentSearchResult[]>([])
+  let contentSearchLoading = $state(false)
+  let contentSearchSubmitted = $state(false)
+  let contentSearchRequestId = 0
   let toolbarVisible = $state(true)
   let customFontInput = $state('')
   let contentEl = $state<HTMLElement | null>(null)
   let bottomSentinel = $state<HTMLElement | null>(null)
   let catalogListEl = $state<HTMLElement | null>(null)
+  let settingsSheetEl = $state<HTMLElement | null>(null)
+  let settingsButtonEl = $state<HTMLElement | null>(null)
+  let contentSearchSheetEl = $state<HTMLElement | null>(null)
+  let contentSearchButtonEl = $state<HTMLElement | null>(null)
+  let contentSearchInputEl = $state<HTMLInputElement | null>(null)
 
   const theme = $derived(themeAt(reading.config.theme))
   const fontFamily = $derived(
@@ -38,7 +56,7 @@
   )
 
   // 段落切分。图片行（后端 ExtractTextWithImages 生成的 <img src="...">）转为图片段。
-  // 进度按累计字数计（与旧 Vue 前端一致），+1 计换行。
+  // 进度按累计字数计，+1 计换行。
   const IMG_RE = /^<img src="([^"]+)">$/
   const splitContent = (raw: string): Paragraph[] => {
     let pos = -1
@@ -154,6 +172,46 @@
     return () => observer.disconnect()
   })
 
+  const openContentSearch = () => {
+    catalogOpen = false
+    settingsOpen = false
+    contentSearchOpen = true
+    requestAnimationFrame(() => contentSearchInputEl?.focus())
+  }
+
+  const submitContentSearch = async () => {
+    const key = contentSearchKey.trim()
+    const bookUrl = reading.book?.bookUrl
+    if (!key) {
+      toast('请输入搜索内容', 'error')
+      return
+    }
+    if (!bookUrl) return
+
+    const requestId = ++contentSearchRequestId
+    contentSearchLoading = true
+    contentSearchSubmitted = true
+    contentSearchResults = []
+    try {
+      const resp = await api.searchBookContent(bookUrl, key)
+      if (requestId !== contentSearchRequestId || reading.book?.bookUrl !== bookUrl) return
+      if (!resp.isSuccess) {
+        toast(resp.errorMsg, 'error')
+        return
+      }
+      contentSearchResults = resp.data
+    } catch {
+      if (requestId === contentSearchRequestId) toast('搜索书籍内容失败', 'error')
+    } finally {
+      if (requestId === contentSearchRequestId) contentSearchLoading = false
+    }
+  }
+
+  const jumpToSearchResult = (result: BookContentSearchResult) => {
+    contentSearchOpen = false
+    toChapter(result.chapterIndex, result.chapterPos)
+  }
+
   const toChapter = (index: number, pos = 0) => {
     if (index < 0) {
       toast('本章是第一章', 'error')
@@ -168,9 +226,25 @@
     saveProgress()
   }
 
-  // 目录打开时滚动到当前章节
+  const selectDrawerTab = (tab: DrawerTab) => {
+    drawerTab = tab
+  }
+
+  const handleDrawerTabKey = (event: KeyboardEvent) => {
+    let tab: DrawerTab | null = null
+    if (event.key === 'ArrowLeft' || event.key === 'Home') tab = 'catalog'
+    if (event.key === 'ArrowRight' || event.key === 'End') tab = 'bookmarks'
+    if (!tab) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    selectDrawerTab(tab)
+    requestAnimationFrame(() => document.getElementById(`drawer-tab-${tab}`)?.focus())
+  }
+
+  // 目录标签激活时滚动到当前章节
   $effect(() => {
-    if (!catalogOpen || !catalogListEl) return
+    if (!catalogOpen || drawerTab !== 'catalog' || !catalogListEl) return
     catalogListEl
       .querySelector('.catalog-item.active')
       ?.scrollIntoView({ block: 'center' })
@@ -239,6 +313,9 @@
         return
       }
       reading.catalog = resp.data
+      void loadBookmarks().then(error => {
+        if (error) toast(error, 'error')
+      })
       const index = Math.min(reading.chapterIndex, resp.data.length - 1)
       await loadChapter(index, reading.chapterPos)
     } catch {
@@ -260,10 +337,55 @@
     }
   })
 
+  $effect(() => {
+    if (!settingsOpen && !contentSearchOpen) return
+    const closeOnOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      if (
+        settingsSheetEl?.contains(target) ||
+        settingsButtonEl?.contains(target) ||
+        contentSearchSheetEl?.contains(target) ||
+        contentSearchButtonEl?.contains(target)
+      ) {
+        return
+      }
+      settingsOpen = false
+      contentSearchOpen = false
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointerDown, true)
+    return () =>
+      document.removeEventListener('pointerdown', closeOnOutsidePointerDown, true)
+  })
+
   const backToShelf = () => {
     saveProgress()
     navigate('/')
   }
+
+  const addBookmark = async () => {
+    settingsOpen = false
+    const error = await createCurrentBookmark()
+    toast(error ?? '已添加书签', error ? 'error' : 'success')
+  }
+
+  const deleteBookmark = async (id: number) => {
+    const bookmark = bookmarks.items.find(item => item.id === id)
+    if (!bookmark) return
+    const error = await removeBookmark(bookmark)
+    if (error) toast(error, 'error')
+  }
+
+  const bookmarkTitle = (index: number) =>
+    reading.catalog[index]?.title ?? `第 ${index + 1} 章`
+
+  const bookmarkTime = (timestamp: number) =>
+    new Date(timestamp).toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
 
   const setCustomFont = () => {
     reading.config.font = -1
@@ -309,19 +431,90 @@
         role="presentation"
         onclick={e => e.stopPropagation()}
       >
-        <div class="drawer-title title-medium">目录（{reading.catalog.length}）</div>
-        <div class="catalog-list" bind:this={catalogListEl}>
-          {#each reading.catalog as chapter, i (chapter.url)}
-            <button
-              class="catalog-item body-medium"
-              class:active={i === reading.chapterIndex}
-              class:volume={chapter.isVolume}
-              onclick={() => toChapter(i)}
-            >
-              {chapter.title}
-            </button>
-          {/each}
+        <div class="drawer-title title-medium">阅读导航</div>
+        <div class="drawer-tabs" role="tablist" aria-label="阅读导航">
+          <button
+            id="drawer-tab-catalog"
+            class="drawer-tab label-large"
+            class:active={drawerTab === 'catalog'}
+            role="tab"
+            aria-selected={drawerTab === 'catalog'}
+            aria-controls="drawer-panel-catalog"
+            tabindex={drawerTab === 'catalog' ? 0 : -1}
+            onclick={() => selectDrawerTab('catalog')}
+            onkeydown={handleDrawerTabKey}
+          >
+            目录（{reading.catalog.length}）
+          </button>
+          <button
+            id="drawer-tab-bookmarks"
+            class="drawer-tab label-large"
+            class:active={drawerTab === 'bookmarks'}
+            role="tab"
+            aria-selected={drawerTab === 'bookmarks'}
+            aria-controls="drawer-panel-bookmarks"
+            tabindex={drawerTab === 'bookmarks' ? 0 : -1}
+            onclick={() => selectDrawerTab('bookmarks')}
+            onkeydown={handleDrawerTabKey}
+          >
+            书签（{bookmarks.items.length}）
+          </button>
         </div>
+        {#if drawerTab === 'catalog'}
+          <div
+            id="drawer-panel-catalog"
+            class="drawer-panel catalog-list"
+            role="tabpanel"
+            aria-labelledby="drawer-tab-catalog"
+            bind:this={catalogListEl}
+          >
+            {#each reading.catalog as chapter, i (chapter.url)}
+              <button
+                class="catalog-item body-medium"
+                class:active={i === reading.chapterIndex}
+                class:volume={chapter.isVolume}
+                onclick={() => toChapter(i)}
+              >
+                {chapter.title}
+              </button>
+            {/each}
+          </div>
+        {:else}
+          <div
+            id="drawer-panel-bookmarks"
+            class="drawer-panel bookmark-panel"
+            role="tabpanel"
+            aria-labelledby="drawer-tab-bookmarks"
+          >
+            {#if bookmarks.items.length === 0}
+              <p class="bookmark-empty body-medium">暂无书签</p>
+            {:else}
+              <div class="bookmark-list">
+                {#each bookmarks.items as bookmark (bookmark.id)}
+                  <div class="bookmark-item">
+                    <button
+                      class="bookmark-link"
+                      onclick={() => toChapter(bookmark.chapterIndex, bookmark.chapterPos)}
+                    >
+                      <span>{bookmarkTitle(bookmark.chapterIndex)}</span>
+                      <small>{bookmarkTime(bookmark.createdAt)}</small>
+                    </button>
+                    <button
+                      class="bookmark-delete"
+                      aria-label={`删除${bookmarkTitle(bookmark.chapterIndex)}的书签`}
+                      onclick={event => {
+                        event.stopPropagation()
+                        deleteBookmark(bookmark.id)
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
       </nav>
     </div>
   {/if}
@@ -333,6 +526,7 @@
     role="presentation"
     onclick={() => {
       settingsOpen = false
+      contentSearchOpen = false
       toolbarVisible = !toolbarVisible
     }}
   >
@@ -400,6 +594,8 @@
         class="bar-item"
         onclick={() => {
           settingsOpen = false
+          contentSearchOpen = false
+          drawerTab = 'catalog'
           catalogOpen = true
         }}
         aria-label="打开目录"
@@ -408,6 +604,23 @@
           <path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z" />
         </svg>
         <span class="label-medium">目录</span>
+      </button>
+      <button
+        class="bar-item"
+        bind:this={contentSearchButtonEl}
+        onclick={openContentSearch}
+        aria-label="全文搜索"
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M9.5 3a6.5 6.5 0 1 0 4.05 11.59l4.43 4.43 1.41-1.41-4.43-4.43A6.5 6.5 0 0 0 9.5 3zm0 2a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9z" />
+        </svg>
+        <span class="label-medium">搜索</span>
+      </button>
+      <button class="bar-item" onclick={addBookmark} aria-label="添加书签">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M6 2a2 2 0 0 0-2 2v18l8-4 8 4V4a2 2 0 0 0-2-2H6zm0 2h12v14.76l-6-3-6 3V4z" />
+        </svg>
+        <span class="label-medium">书签</span>
       </button>
       <button class="bar-item" onclick={() => toChapter(reading.chapterIndex - 1)} aria-label="上一章">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
@@ -435,8 +648,10 @@
       </button>
       <button
         class="bar-item"
+        bind:this={settingsButtonEl}
         onclick={() => {
           catalogOpen = false
+          contentSearchOpen = false
           settingsOpen = !settingsOpen
         }}
         aria-label="打开设置"
@@ -467,9 +682,49 @@
     </div>
   {/if}
 
+  <!-- MD3 Bottom sheet：全文搜索 -->
+  {#if contentSearchOpen}
+    <section class="sheet search-sheet" bind:this={contentSearchSheetEl} aria-label="全文搜索">
+      <div class="sheet-handle"></div>
+      <form
+        class="content-search-form"
+        onsubmit={event => {
+          event.preventDefault()
+          submitContentSearch()
+        }}
+      >
+        <input
+          bind:this={contentSearchInputEl}
+          bind:value={contentSearchKey}
+          placeholder="搜索当前书籍"
+          aria-label="搜索当前书籍"
+        />
+        <button class="btn-tonal" type="submit" disabled={contentSearchLoading}>
+          {contentSearchLoading ? '搜索中…' : '搜索'}
+        </button>
+      </form>
+      {#if contentSearchLoading}
+        <p class="content-search-status body-medium">正在搜索全文…</p>
+      {:else if !contentSearchSubmitted}
+        <p class="content-search-status body-medium">输入关键词，搜索当前书籍的全部正文。</p>
+      {:else if contentSearchResults.length === 0}
+        <p class="content-search-status body-medium">未找到匹配内容。</p>
+      {:else}
+        <div class="content-search-results">
+          {#each contentSearchResults as result, i (`${result.chapterIndex}-${result.chapterPos}-${i}`)}
+            <button class="content-search-result" onclick={() => jumpToSearchResult(result)}>
+              <span class="content-search-result-title label-medium">{result.chapterTitle}</span>
+              <span class="content-search-result-snippet body-medium">{result.snippet}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
+
   <!-- MD3 Bottom sheet：阅读设置 -->
   {#if settingsOpen}
-    <div class="sheet">
+    <div class="sheet" bind:this={settingsSheetEl}>
       <div class="sheet-handle"></div>
       <div class="setting-row">
         <span class="body-medium">阅读主题</span>
@@ -717,10 +972,121 @@
     color: var(--md-on-surface-variant);
   }
 
+  .drawer-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 0 12px 8px;
+    border-bottom: 1px solid var(--md-outline-variant);
+  }
+
+  .drawer-tab {
+    position: relative;
+    flex: 1;
+    padding: 12px 8px;
+    background: transparent;
+    color: var(--md-on-surface-variant);
+    border-radius: var(--md-shape-md) var(--md-shape-md) 0 0;
+    box-shadow: none;
+  }
+
+  .drawer-tab::after {
+    position: absolute;
+    right: 16px;
+    bottom: 0;
+    left: 16px;
+    height: 3px;
+    background: transparent;
+    border-radius: var(--md-shape-full);
+    content: '';
+  }
+
+  .drawer-tab:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+    box-shadow: none;
+    opacity: 1;
+  }
+
+  .drawer-tab.active {
+    color: var(--md-primary);
+  }
+
+  .drawer-tab.active::after {
+    background: var(--md-primary);
+  }
+
+  .drawer-tab:focus-visible {
+    outline: 2px solid var(--md-primary);
+    outline-offset: -2px;
+  }
+
+  .drawer-panel {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .bookmark-panel {
+    padding: 12px;
+  }
+
+  .bookmark-empty {
+    margin: 4px 16px;
+    color: var(--md-on-surface-variant);
+  }
+
+  .bookmark-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .bookmark-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .bookmark-link {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 8px 16px;
+    text-align: left;
+    background: transparent;
+    color: var(--md-on-surface-variant);
+    border-radius: var(--md-shape-md);
+    box-shadow: none;
+  }
+
+  .bookmark-link small {
+    color: var(--md-on-surface-variant);
+    opacity: 0.72;
+  }
+
+  .bookmark-link:hover,
+  .bookmark-delete:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+    box-shadow: none;
+    opacity: 1;
+  }
+
+  .bookmark-delete {
+    flex-shrink: 0;
+    padding: 8px;
+    background: transparent;
+    color: var(--md-error);
+    border-radius: var(--md-shape-md);
+    box-shadow: none;
+  }
+
   .catalog-list {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
-    padding: 0 12px 12px;
+    padding: 12px 12px 12px;
   }
 
   .catalog-item {
@@ -781,6 +1147,67 @@
     background: var(--md-outline-variant);
     margin: 8px auto 12px;
     flex-shrink: 0;
+  }
+
+  .search-sheet {
+    gap: 12px;
+  }
+
+  .content-search-form {
+    display: flex;
+    gap: 8px;
+  }
+
+  .content-search-form input {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+  }
+
+  .content-search-form button {
+    flex-shrink: 0;
+  }
+
+  .content-search-status {
+    margin: 4px 0 12px;
+    color: var(--md-on-surface-variant);
+  }
+
+  .content-search-results {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .content-search-result {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    width: 100%;
+    padding: 12px;
+    text-align: left;
+    color: var(--md-on-surface);
+    background: transparent;
+    border-radius: var(--md-shape-md);
+    box-shadow: none;
+  }
+
+  .content-search-result:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+    box-shadow: none;
+    opacity: 1;
+  }
+
+  .content-search-result-title {
+    color: var(--md-primary);
+  }
+
+  .content-search-result-snippet {
+    color: var(--md-on-surface-variant);
+    text-indent: 0;
   }
 
   .setting-row {
@@ -915,13 +1342,22 @@
     }
 
     .content-wrapper {
-      padding: 0 0 100px;
+      padding: 0 0 calc(124px + env(safe-area-inset-bottom, 0px));
     }
 
-    /* 8 个操作均分整条底栏，杜绝横向滚动 */
+    /* 10 个操作使用两行网格，保证窄屏点击目标不会过小或横向滚动。 */
+    .bottom-app-bar {
+      height: calc(112px + env(safe-area-inset-bottom, 0px));
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-rows: repeat(2, 52px);
+      gap: 0;
+      padding: 4px 6px calc(4px + env(safe-area-inset-bottom, 0px));
+      overflow: hidden;
+    }
+
     .bar-item {
       min-width: 0;
-      flex: 1;
       padding: 4px 0;
     }
 
@@ -929,14 +1365,8 @@
       display: none;
     }
 
-    .bottom-app-bar {
-      height: calc(56px + env(safe-area-inset-bottom, 0px));
-      padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
-      gap: 0;
-    }
-
     .sheet {
-      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      bottom: calc(112px + env(safe-area-inset-bottom, 0px));
       width: 100%;
       max-height: 60vh;
     }

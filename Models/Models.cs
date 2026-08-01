@@ -38,6 +38,18 @@ public record BookProgress(
     string BookUrl = ""
 );
 
+public record Bookmark(
+    long Id,
+    string BookUrl,
+    int ChapterIndex,
+    int ChapterPos,
+    long CreatedAt
+);
+
+public record CreateBookmarkRequest(string BookUrl, int ChapterIndex, int ChapterPos);
+
+public record DeleteBookmarkRequest(string BookUrl, long Id);
+
 public record BookChapter(
     string Title,
     string Url,
@@ -47,6 +59,13 @@ public record BookChapter(
     string BookUrl = "",
     bool IsVip = false,
     bool IsPay = false
+);
+
+public record BookContentSearchResult(
+    int ChapterIndex,
+    string ChapterTitle,
+    int ChapterPos,
+    string Snippet
 );
 
 // API 响应包装类

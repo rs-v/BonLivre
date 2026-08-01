@@ -2,18 +2,33 @@
 
 [English](#english) | [中文](#chinese)
 
+## Screenshots / 界面预览
+
+**Bookshelf / 书架** — Search, recent reading, and the local library / 搜索、最近阅读与本地图书库
+
+![Bookshelf view](assets/bookshelf.png)
+
+**Reader / 阅读器** — EPUB and TXT reading controls, including catalog, search, and bookmarks / EPUB、TXT 阅读控制：目录、搜索与书签
+
+![In-reader view](assets/in%20reader.png)
+
+**Reading settings / 阅读设置** — Themes, typography, layout, and continuous reading / 主题、排版、布局与连续阅读
+
+![Reading settings view](assets/theme.png)
+
 <a name="english"></a>
 ## English
 
-BonLivre is a lightweight book reading application built with .NET 10 and Vue 3. It supports local EPUB and TXT file reading with a modern web interface.
+BonLivre is a lightweight book reading application built with .NET 10 and Svelte 5. It supports local EPUB and TXT file reading with a modern web interface.
 
 ### ✨ Features
 
-- 📚 **Local Book Management**: Support for EPUB and TXT format books
-- 🌐 **Web-Based Reader**: Modern, responsive reading interface built with Vue 3
-- 💾 **Reading Progress Tracking**: Automatically saves your reading position
-- 🎨 **Customizable Reading Experience**: Adjustable font size, theme, and layout
-- 🔍 **Book Search**: Search through your local book collection
+- 📚 **Local Book Management**: Import EPUB and TXT files from the bookshelf, or place them in `books/`
+- 🌐 **Web-Based Reader**: A modern, responsive Svelte 5 reading interface
+- 💾 **Persistent Progress**: Saves your reading position automatically, including when leaving the page
+- 🔖 **Catalog and Bookmarks**: Navigate chapters or manage persistent bookmarks from dedicated tabs
+- 🔍 **Local Search**: Search the local library by title/author and search within a local book
+- 🎨 **Customizable Reading Experience**: Themes, built-in or local fonts, typography, page width, animation, and continuous reading
 - 🚀 **Native AOT**: Built with .NET Native AOT for fast startup and low memory footprint
 - 📱 **Cross-Platform**: Works on Windows, Linux, and macOS
 
@@ -24,14 +39,15 @@ BonLivre is a lightweight book reading application built with .NET 10 and Vue 3.
 - ASP.NET Core Minimal APIs
 - VersOne.Epub for EPUB file processing
 - HtmlAgilityPack for HTML parsing
-- SQLite for data storage
+- LiteDB for data storage
+
+> **Storage migration:** LiteDB stores settings, progress, and bookmarks in `data/bonlivre.db`. Existing `data/*.sqlite` files are not imported, so upgrading starts with fresh persisted data.
 
 **Frontend:**
-- Vue 3 with Composition API
-- Vite for build tooling
-- Element Plus UI framework
-- Pinia for state management
-- Vue Router for navigation
+- Svelte 5 with runes
+- Vite and TypeScript
+- Built-in hash router
+- Rune-based shared state
 
 ### 📋 Requirements
 
@@ -66,9 +82,9 @@ The backend will start on `http://localhost:5000` and `http://localhost:5001`.
 
 #### Frontend Setup
 
-1. Navigate to the web directory:
+1. Navigate to the frontend directory:
 ```bash
-cd web
+cd web-svelte
 ```
 
 2. Install dependencies:
@@ -96,23 +112,21 @@ BonLivre/
 │   ├── LocalBookService.cs
 │   └── BookProgressStore.cs
 ├── books/               # Local book storage directory
-├── web/                 # Vue 3 frontend application
-│   ├── src/
-│   │   ├── pages/
-│   │   │   ├── bookshelf/
-│   │   │   └── source/
-│   │   └── ...
-│   └── ...
+├── web-svelte/          # Svelte 5 frontend application
+│   └── src/
 ├── Program.cs           # Application entry point
 └── BonLivre.csproj     # Project file
 ```
 
 ### 📖 Usage
 
-1. **Adding Books**: Place your EPUB or TXT files in the `books/` directory
-2. **Access the Reader**: Navigate to `http://localhost:8080/` for the bookshelf
-3. **Book Source Editor**: Access `http://localhost:8080/#/bookSource` for book source editing
-4. **RSS Source Editor**: Access `http://localhost:8080/#/rssSource` for RSS source editing
+1. **Open the Bookshelf**: Navigate to `http://localhost:8080/` in development, then use the **+** button to import one or more EPUB or TXT files. Alternatively, copy compatible files into the `books/` directory.
+2. **Read or Resume**: Select a book from the shelf. BonLivre restores its saved reading position automatically.
+3. **Navigate and Save Places**: Use the reader toolbar to open the catalog, add bookmarks, and switch to the Bookmarks tab to reopen or remove them.
+4. **Search and Customize**: Search the current local book’s full text, then use reading settings to adjust themes, fonts, typography, width, animation, and continuous reading.
+5. **Remove a Book**: Delete a local book from the bookshelf to move its file into `books/.trash/`; recover it manually from that directory if needed.
+
+> Library search matches locally available book titles and authors. It does not search remote book catalogues.
 
 ### 🔐 Authentication (Optional)
 
@@ -144,19 +158,23 @@ How the credential is transmitted:
 #### Bookshelf Endpoints
 - `GET /getBookshelf` - Get all books in the bookshelf
 - `POST /saveBook` - Save a book to the bookshelf
-- `POST /deleteBook` - Delete a book from the bookshelf
+- `POST /deleteBook` - Move a local book to `books/.trash/`
+- `POST /uploadBook[?overwrite=true]` - Upload one or more local EPUB or TXT files
 - `GET /getChapterList?url={url}` - Get chapter list for a book
 - `GET /getBookContent?url={url}&index={index}` - Get content of a specific chapter
+- `GET /searchBookContent?url={url}&key={key}` - Search content within a local book
 - `GET /cover?path={path}` - Get book cover image
 - `GET /image?url={url}&path={path}` - Get images from EPUB files
 - `GET /getReadConfig` - Get reading configuration
 - `POST /saveReadConfig` - Save reading configuration
 - `POST /saveBookProgress` - Save reading progress
+- `GET /getBookmarks?bookUrl={bookUrl}` - Get bookmarks for a book
+- `POST /createBookmark` - Create a bookmark at the current reading position
+- `POST /deleteBookmark` - Delete a bookmark
 
-#### Source Endpoints
-- `GET /getBookSources` - Get all book sources
-- `POST /saveBookSource` - Save a book source
-- `WS /searchBook` - WebSocket endpoint for book search
+#### Source Compatibility Endpoints
+- `GET /getBookSources` and `POST /saveBookSource` - Compatibility stubs; remote-source management is not implemented
+- `WS /searchBook` - Search locally available book titles and authors over WebSocket
 
 ### 🔧 Development
 
@@ -176,23 +194,18 @@ dotnet publish -c Release -r win-x64
 
 Development mode with hot-reload:
 ```bash
-cd web
+cd web-svelte
 pnpm dev
+```
+
+Check types and Svelte components:
+```bash
+pnpm check
 ```
 
 Build for production:
 ```bash
 pnpm build
-```
-
-Lint and fix code:
-```bash
-pnpm lint:fix
-```
-
-Format code:
-```bash
-pnpm format
 ```
 
 <a name="deployment"></a>
@@ -206,13 +219,15 @@ Every push to `main` builds self-contained executables for **Windows x64** and *
 2. Download the `bonlivre-win-x64` or `bonlivre-linux-x64` artifact from the run's **Artifacts** section.
 3. Unzip it, then run the `BonLivre` executable (see [Running the published app](#running) below).
 
-Each artifact is a native executable bundled with the frontend `wwwroot/`, so no .NET runtime or Node toolchain is needed on the target machine. Artifacts are retained for 7 days.
+Each artifact is a native executable bundled with the frontend `wwwroot/`, so no .NET runtime or Node toolchain is needed on the target machine. Release artifacts omit debug symbols and all book files to keep downloads small. Artifacts are retained for 7 days.
+
+Book files are intentionally not bundled. On first start the app creates an empty `books/` directory beside the executable; copy EPUB/TXT files there or upload them from the bookshelf UI.
 
 #### Building locally
 
 The backend serves the frontend as static files, so a single Native AOT executable is all you need to run in production — no separate web server for the UI.
 
-Publishing builds the frontend and bundles it automatically. The `BuildFrontend` MSBuild target (in `BonLivre.csproj`) runs `pnpm install` + `pnpm build` and copies `web/dist/` into `wwwroot/` before publish, so one command produces a self-contained executable plus its `wwwroot/`:
+Publishing builds the frontend and bundles it automatically. The `BuildFrontend` MSBuild target (in `BonLivre.csproj`) runs `pnpm install` + `pnpm build` and copies `web-svelte/dist/` into `wwwroot/` before publish, so one command produces a self-contained executable plus its `wwwroot/`:
 
 ```bash
 dotnet publish -c Release -r win-x64      # Windows x64
@@ -260,15 +275,16 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 <a name="chinese"></a>
 ## 中文
 
-BonLivre 是一个使用 .NET 10 和 Vue 3 构建的轻量级图书阅读应用程序。它支持本地 EPUB 和 TXT 文件阅读，具有现代化的 Web 界面。
+BonLivre 是一个使用 .NET 10 和 Svelte 5 构建的轻量级图书阅读应用程序。它支持本地 EPUB 和 TXT 文件阅读，具有现代化的 Web 界面。
 
 ### ✨ 特性
 
-- 📚 **本地图书管理**：支持 EPUB 和 TXT 格式的图书
-- 🌐 **Web 端阅读器**：使用 Vue 3 构建的现代化、响应式阅读界面
-- 💾 **阅读进度追踪**：自动保存您的阅读位置
-- 🎨 **可定制的阅读体验**：可调节字体大小、主题和布局
-- 🔍 **图书搜索**：搜索您的本地图书收藏
+- 📚 **本地图书管理**：可从书架导入 EPUB、TXT 文件，也可直接放入 `books/` 目录
+- 🌐 **Web 端阅读器**：使用 Svelte 5 构建的现代化、响应式阅读界面
+- 💾 **持久化阅读进度**：自动保存阅读位置，离开页面时也会保存
+- 🔖 **目录和书签**：在独立标签页中切换章节目录，并管理持久化书签
+- 🔍 **本地搜索**：按书名、作者搜索本地图书，也可搜索一本本地图书的全文
+- 🎨 **可定制的阅读体验**：主题、内置或本机字体、排版、阅读宽度、动画和连续阅读
 - 🚀 **Native AOT**：使用 .NET Native AOT 编译，实现快速启动和低内存占用
 - 📱 **跨平台**：支持 Windows、Linux 和 macOS
 
@@ -279,14 +295,15 @@ BonLivre 是一个使用 .NET 10 和 Vue 3 构建的轻量级图书阅读应用�
 - ASP.NET Core Minimal APIs
 - VersOne.Epub 用于 EPUB 文件处理
 - HtmlAgilityPack 用于 HTML 解析
-- SQLite 用于数据存储
+- LiteDB 用于数据存储
+
+> **存储迁移：**LiteDB 将设置、阅读进度和书签保存到 `data/bonlivre.db`。不会导入已有的 `data/*.sqlite` 文件，因此升级后会从新的持久化数据开始。
 
 **前端：**
-- Vue 3 与 Composition API
-- Vite 构建工具
-- Element Plus UI 框架
-- Pinia 状态管理
-- Vue Router 路由导航
+- Svelte 5 与 runes
+- Vite 与 TypeScript
+- 内置 hash 路由
+- 基于 rune 的共享状态
 
 ### 📋 系统要求
 
@@ -321,9 +338,9 @@ dotnet run
 
 #### 前端设置
 
-1. 进入 web 目录：
+1. 进入前端目录：
 ```bash
-cd web
+cd web-svelte
 ```
 
 2. 安装依赖：
@@ -351,23 +368,21 @@ BonLivre/
 │   ├── LocalBookService.cs
 │   └── BookProgressStore.cs
 ├── books/               # 本地图书存储目录
-├── web/                 # Vue 3 前端应用程序
-│   ├── src/
-│   │   ├── pages/
-│   │   │   ├── bookshelf/
-│   │   │   └── source/
-│   │   └── ...
-│   └── ...
+├── web-svelte/          # Svelte 5 前端应用程序
+│   └── src/
 ├── Program.cs           # 应用程序入口点
 └── BonLivre.csproj     # 项目文件
 ```
 
 ### 📖 使用方法
 
-1. **添加图书**：将您的 EPUB 或 TXT 文件放入 `books/` 目录
-2. **访问阅读器**：导航到 `http://localhost:8080/` 查看书架
-3. **书源编辑**：访问 `http://localhost:8080/#/bookSource` 进行书源编辑
-4. **订阅源编辑**：访问 `http://localhost:8080/#/rssSource` 进行订阅源编辑
+1. **打开书架**：开发环境访问 `http://localhost:8080/`，点击 **+** 按钮即可导入一个或多个 EPUB、TXT 文件；也可以把兼容文件直接复制到 `books/` 目录。
+2. **阅读或续读**：在书架中选择图书，BonLivre 会自动恢复已保存的阅读位置。
+3. **导航与书签**：使用阅读器工具栏打开目录、添加书签，并在「书签」标签页中重新打开或删除书签。
+4. **搜索和自定义**：搜索当前本地图书的全文；在阅读设置中调整主题、字体、排版、宽度、动画和连续阅读。
+5. **移除图书**：从书架删除本地图书会将文件移入 `books/.trash/`；需要时可从该目录手动恢复。
+
+> 书架搜索只匹配本地已有图书的书名和作者，不会搜索远程书库。
 
 ### 🔐 认证（可选）
 
@@ -399,19 +414,23 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 #### 书架端点
 - `GET /getBookshelf` - 获取书架中的所有图书
 - `POST /saveBook` - 保存图书到书架
-- `POST /deleteBook` - 从书架删除图书
+- `POST /deleteBook` - 将本地图书移入 `books/.trash/`
+- `POST /uploadBook[?overwrite=true]` - 上传一个或多个本地 EPUB、TXT 文件
 - `GET /getChapterList?url={url}` - 获取图书的章节列表
 - `GET /getBookContent?url={url}&index={index}` - 获取特定章节的内容
+- `GET /searchBookContent?url={url}&key={key}` - 在本地图书中搜索全文
 - `GET /cover?path={path}` - 获取图书封面图片
 - `GET /image?url={url}&path={path}` - 从 EPUB 文件获取图片
 - `GET /getReadConfig` - 获取阅读配置
 - `POST /saveReadConfig` - 保存阅读配置
 - `POST /saveBookProgress` - 保存阅读进度
+- `GET /getBookmarks?bookUrl={bookUrl}` - 获取图书书签
+- `POST /createBookmark` - 在当前阅读位置创建书签
+- `POST /deleteBookmark` - 删除书签
 
-#### 书源端点
-- `GET /getBookSources` - 获取所有书源
-- `POST /saveBookSource` - 保存书源
-- `WS /searchBook` - 图书搜索的 WebSocket 端点
+#### 书源兼容端点
+- `GET /getBookSources`、`POST /saveBookSource` - 兼容性存根；尚未实现远程书源管理
+- `WS /searchBook` - 通过 WebSocket 搜索本地已有图书的书名和作者
 
 ### 🔧 开发
 
@@ -431,23 +450,18 @@ dotnet publish -c Release -r win-x64
 
 开发模式（热重载）：
 ```bash
-cd web
+cd web-svelte
 pnpm dev
+```
+
+检查类型和 Svelte 组件：
+```bash
+pnpm check
 ```
 
 构建生产版本：
 ```bash
 pnpm build
-```
-
-代码检查和修复：
-```bash
-pnpm lint:fix
-```
-
-格式化代码：
-```bash
-pnpm format
 ```
 
 <a name="deployment-zh"></a>
@@ -461,13 +475,15 @@ pnpm format
 2. 在该运行的 **Artifacts** 区域下载 `bonlivre-win-x64` 或 `bonlivre-linux-x64` 产物。
 3. 解压后运行其中的 `BonLivre` 可执行文件（见下方[运行已发布的程序](#running-zh)）。
 
-每个产物都是原生可执行文件，且已打包前端 `wwwroot/`，目标机器无需安装 .NET 运行时或 Node 工具链。产物保留 7 天。
+每个产物都是原生可执行文件，且已打包前端 `wwwroot/`，目标机器无需安装 .NET 运行时或 Node 工具链。为缩小下载体积，Release 产物不包含调试符号和任何书籍文件。产物保留 7 天。
+
+书籍文件不会随发布包分发。程序首次启动时会在可执行文件旁创建空的 `books/` 目录；可将 EPUB/TXT 文件复制到该目录，或通过书架页面上传。
 
 #### 本地构建
 
 后端会以静态文件形式托管前端，因此生产环境只需运行一个 Native AOT 可执行文件即可——无需为界面另起 Web 服务器。
 
-发布时会自动构建并打包前端。`BonLivre.csproj` 中的 `BuildFrontend` MSBuild target 会在 publish 前执行 `pnpm install` + `pnpm build`，并把 `web/dist/` 拷入 `wwwroot/`，因此一条命令即可产出「自包含可执行文件 + `wwwroot/`」：
+发布时会自动构建并打包前端。`BonLivre.csproj` 中的 `BuildFrontend` MSBuild target 会在 publish 前执行 `pnpm install` + `pnpm build`，并把 `web-svelte/dist/` 拷入 `wwwroot/`，因此一条命令即可产出「自包含可执行文件 + `wwwroot/`」：
 
 ```bash
 dotnet publish -c Release -r win-x64      # Windows x64

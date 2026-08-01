@@ -2,7 +2,11 @@ import type {
   ApiResponse,
   Book,
   BookChapter,
+  Bookmark,
+  BookContentSearchResult,
   BookProgress,
+  CreateBookmarkRequest,
+  DeleteBookmarkRequest,
   ReadConfig,
   SearchBook,
 } from './types'
@@ -103,6 +107,11 @@ export const getBookContent = (bookUrl: string, index: number) =>
     `getBookContent?url=${encodeURIComponent(bookUrl)}&index=${index}`,
   )
 
+export const searchBookContent = (bookUrl: string, key: string) =>
+  request<BookContentSearchResult[]>(
+    `searchBookContent?url=${encodeURIComponent(bookUrl)}&key=${encodeURIComponent(key)}`,
+  )
+
 export const saveBook = (book: Book | SearchBook) => postJson<string>('saveBook', book)
 export const deleteBook = (book: Book) => postJson<string>('deleteBook', book)
 
@@ -115,7 +124,16 @@ export const uploadBook = async (files: File[], overwrite = false) => {
   })
 }
 
-// ---------- 进度与配置 ----------
+// ---------- 书签、进度与配置 ----------
+
+export const getBookmarks = (bookUrl: string) =>
+  request<Bookmark[]>(`getBookmarks?bookUrl=${encodeURIComponent(bookUrl)}`)
+
+export const createBookmark = (bookmark: CreateBookmarkRequest) =>
+  postJson<Bookmark>('createBookmark', bookmark)
+
+export const deleteBookmark = (bookmark: DeleteBookmarkRequest) =>
+  postJson<string>('deleteBookmark', bookmark)
 
 /** 校验连通性并读取阅读配置；可传入待校验地址（连接对话框用） */
 export const getReadConfig = async (urlOverride?: string): Promise<ReadConfig | null> => {
