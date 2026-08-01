@@ -39,7 +39,9 @@
   let contentSearchLoading = $state(false)
   let contentSearchSubmitted = $state(false)
   let contentSearchRequestId = 0
-  let toolbarVisible = $state(true)
+  let toolbarVisible = $state(
+    typeof window === 'undefined' || !window.matchMedia('(max-width: 750px)').matches,
+  )
   let customFontInput = $state('')
   let contentEl = $state<HTMLElement | null>(null)
   let bottomSentinel = $state<HTMLElement | null>(null)
@@ -177,6 +179,16 @@
     settingsOpen = false
     contentSearchOpen = true
     requestAnimationFrame(() => contentSearchInputEl?.focus())
+  }
+
+  const handleContentTap = (event: MouseEvent) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    if (target.closest('button, a, input, textarea, select, [contenteditable="true"]')) return
+
+    settingsOpen = false
+    contentSearchOpen = false
+    toolbarVisible = !toolbarVisible
   }
 
   const submitContentSearch = async () => {
@@ -338,6 +350,15 @@
   })
 
   $effect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 750px)')
+    const updateToolbarVisibility = () => {
+      toolbarVisible = !mediaQuery.matches
+    }
+    mediaQuery.addEventListener('change', updateToolbarVisibility)
+    return () => mediaQuery.removeEventListener('change', updateToolbarVisibility)
+  })
+
+  $effect(() => {
     if (!settingsOpen && !contentSearchOpen) return
     const closeOnOutsidePointerDown = (event: PointerEvent) => {
       const target = event.target
@@ -422,6 +443,7 @@
   style:background={theme.body}
   style:color={theme.text}
   class:md-dark={reading.config.theme === NIGHT_THEME_INDEX}
+  class:toolbar-visible={toolbarVisible}
 >
   <!-- MD3 Modal navigation drawer：目录 -->
   {#if catalogOpen}
@@ -519,16 +541,12 @@
     </div>
   {/if}
 
-  <!-- 正文：点击空白区域切换工具栏显隐 -->
+  <!-- 正文：点击非交互区域切换工具栏显隐 -->
   <div
     class="content-wrapper"
     bind:this={contentEl}
     role="presentation"
-    onclick={() => {
-      settingsOpen = false
-      contentSearchOpen = false
-      toolbarVisible = !toolbarVisible
-    }}
+    onclick={handleContentTap}
   >
     <article
       class="content"
@@ -539,7 +557,6 @@
       style:letter-spacing="{reading.config.spacing.letter}em"
       style:line-height={1 + reading.config.spacing.line}
       role="presentation"
-      onclick={e => e.stopPropagation()}
     >
       {#if contentLoading}
         <p class="loading">加载中…</p>
@@ -857,7 +874,11 @@
   .content-wrapper {
     flex: 1;
     overflow-y: auto;
-    padding: 24px 16px 100px;
+    padding: 24px 16px;
+  }
+
+  .reader.toolbar-visible .content-wrapper {
+    padding-bottom: 100px;
   }
 
   .content {
@@ -1342,7 +1363,11 @@
     }
 
     .content-wrapper {
-      padding: 0 0 calc(124px + env(safe-area-inset-bottom, 0px));
+      padding: 0 0 calc(12px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .reader.toolbar-visible .content-wrapper {
+      padding-bottom: calc(124px + env(safe-area-inset-bottom, 0px));
     }
 
     /* 10 个操作使用两行网格，保证窄屏点击目标不会过小或横向滚动。 */
@@ -1366,9 +1391,13 @@
     }
 
     .sheet {
-      bottom: calc(112px + env(safe-area-inset-bottom, 0px));
+      bottom: env(safe-area-inset-bottom, 0px);
       width: 100%;
       max-height: 60vh;
+    }
+
+    .reader.toolbar-visible .sheet {
+      bottom: calc(112px + env(safe-area-inset-bottom, 0px));
     }
 
     .drawer {
