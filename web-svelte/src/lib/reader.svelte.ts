@@ -21,13 +21,18 @@ export const reading = $state<{
 export const bookmarks = $state<{ items: Bookmark[] }>({ items: [] })
 
 const READING_KEY = 'readingBook'
+const lastSavedAtByBook = new Map<string, number>()
+const lastProgressTimeByBook = new Map<string, number>()
 
 /** 进入阅读器前调用：记录书籍并持久化，刷新后仍能恢复 */
 export const startReading = (book: Book) => {
   reading.book = book
-  reading.chapterIndex = book.durChapterIndex ?? 0
-  reading.chapterPos = book.durChapterPos ?? 0
+  reading.catalog = []
+  reading.chapterIndex = Math.max(0, book.durChapterIndex ?? 0)
+  reading.chapterPos = Math.max(0, book.durChapterPos ?? 0)
   bookmarks.items = []
+  lastSavedAtByBook.delete(book.bookUrl)
+  lastProgressTimeByBook.set(book.bookUrl, book.durChapterTime ?? 0)
   localStorage.setItem(READING_KEY, JSON.stringify(book))
 }
 
@@ -110,29 +115,75 @@ export const removeBookmark = async (bookmark: Bookmark): Promise<string | null>
 
 export const currentProgress = (): BookProgress | null => {
   const book = reading.book
-  const title = reading.catalog[reading.chapterIndex]?.title
-  if (!book || !title) return null
+  if (!book) return null
+
+  const chapterIndex = Math.max(0, reading.chapterIndex)
+  const catalogTitle = reading.catalog[chapterIndex]?.title?.trim()
+  const restoredTitle =
+    book.durChapterIndex === chapterIndex ? book.durChapterTitle?.trim() : ''
+  const previousTime = lastProgressTimeByBook.get(book.bookUrl) ?? book.durChapterTime ?? 0
+  const progressTime = Math.max(Date.now(), previousTime + 1)
+  lastProgressTimeByBook.set(book.bookUrl, progressTime)
+
   return {
     name: book.name,
     author: book.author,
     bookUrl: book.bookUrl,
-    durChapterIndex: reading.chapterIndex,
-    durChapterPos: reading.chapterPos,
-    durChapterTime: Date.now(),
-    durChapterTitle: title,
+    durChapterIndex: chapterIndex,
+    durChapterPos: Math.max(0, reading.chapterPos),
+    durChapterTime: progressTime,
+    durChapterTitle: catalogTitle || restoredTitle || `第 ${chapterIndex + 1} 章`,
   }
 }
 
-let lastSavedAt = 0
+const persistProgressLocally = (progress: BookProgress) => {
+  const book = reading.book
+  if (!book || book.bookUrl !== progress.bookUrl || book.durChapterTime > progress.durChapterTime)
+    return
+  const updated = {
+    ...book,
+    durChapterIndex: progress.durChapterIndex,
+    durChapterPos: progress.durChapterPos,
+    durChapterTime: progress.durChapterTime,
+    durChapterTitle: progress.durChapterTitle,
+  }
+  reading.book = updated
+  localStorage.setItem(READING_KEY, JSON.stringify(updated))
+}
 
-/** 保存进度（sendBeacon，页面关闭也可靠）；throttleMs 内重复调用会被跳过 */
-export const saveProgress = (throttleMs = 0) => {
-  const progress = currentProgress()
-  if (!progress) return
+/** 常规保存进度；throttleMs 内同一本书的重复调用会被跳过。 */
+export const saveProgress = async (throttleMs = 0): Promise<boolean> => {
+  const bookUrl = reading.book?.bookUrl
+  if (!bookUrl) return false
+
   const now = Date.now()
-  if (throttleMs > 0 && now - lastSavedAt < throttleMs) return
-  lastSavedAt = now
-  api.saveBookProgressWithBeacon(progress)
+  const lastSavedAt = lastSavedAtByBook.get(bookUrl) ?? 0
+  if (throttleMs > 0 && now - lastSavedAt < throttleMs) return true
+
+  lastSavedAtByBook.set(bookUrl, now)
+  const progress = currentProgress()
+  if (!progress) return false
+
+  try {
+    const resp = await api.saveBookProgress(progress)
+    if (!resp.isSuccess) {
+      if (lastSavedAtByBook.get(bookUrl) === now) lastSavedAtByBook.delete(bookUrl)
+      return false
+    }
+    persistProgressLocally(progress)
+    return true
+  } catch {
+    if (lastSavedAtByBook.get(bookUrl) === now) lastSavedAtByBook.delete(bookUrl)
+    return false
+  }
+}
+
+/** 页面隐藏或卸载时使用 Beacon/keepalive 尽力刷新进度。 */
+export const flushProgress = (): boolean => {
+  const progress = currentProgress()
+  if (!progress) return false
+  persistProgressLocally(progress)
+  return api.saveBookProgressWithBeacon(progress)
 }
 
 export const loadConfig = async () => {

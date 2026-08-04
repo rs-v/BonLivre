@@ -7,6 +7,7 @@
     bookmarks,
     restoreReading,
     saveProgress,
+    flushProgress,
     saveConfig,
     loadConfig,
     loadBookmarks,
@@ -152,7 +153,7 @@
             document.title = reading.catalog[chapterIdx]?.title ?? document.title
           }
           reading.chapterPos = pos
-          saveProgress(60_000)
+          void saveProgress(60_000)
         }
       },
       { root: contentEl, rootMargin: '0px 0px -80% 0px' },
@@ -224,7 +225,7 @@
     toChapter(result.chapterIndex, result.chapterPos)
   }
 
-  const toChapter = (index: number, pos = 0) => {
+  const toChapter = async (index: number, pos = 0) => {
     if (index < 0) {
       toast('本章是第一章', 'error')
       return
@@ -234,8 +235,8 @@
       return
     }
     catalogOpen = false
-    loadChapter(index, pos)
-    saveProgress()
+    await loadChapter(index, pos)
+    void saveProgress()
   }
 
   const selectDrawerTab = (tab: DrawerTab) => {
@@ -330,6 +331,7 @@
       })
       const index = Math.min(reading.chapterIndex, resp.data.length - 1)
       await loadChapter(index, reading.chapterPos)
+      void saveProgress()
     } catch {
       toast('获取目录失败，请检查后端连接', 'error')
     }
@@ -338,14 +340,17 @@
   $effect(() => {
     init()
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') saveProgress()
+      if (document.visibilityState === 'hidden') flushProgress()
     }
+    const onPageHide = () => flushProgress()
     document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('pagehide', onPageHide)
     window.addEventListener('keydown', handleKey)
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('pagehide', onPageHide)
       window.removeEventListener('keydown', handleKey)
-      saveProgress()
+      flushProgress()
     }
   })
 
@@ -379,8 +384,12 @@
       document.removeEventListener('pointerdown', closeOnOutsidePointerDown, true)
   })
 
-  const backToShelf = () => {
-    saveProgress()
+  const backToShelf = async () => {
+    const saved = await saveProgress()
+    if (!saved) {
+      toast('阅读进度保存失败，将在后台重试', 'error')
+      flushProgress()
+    }
     navigate('/')
   }
 

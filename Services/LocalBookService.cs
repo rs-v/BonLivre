@@ -159,8 +159,7 @@ public partial class LocalBookService
                     if (totalChapters > 0)
                     {
                         var lastFile = epub.ReadingOrder[totalChapters - 1];
-                        latestChapter = epub.Navigation?.FirstOrDefault(n => n.Link?.ContentFilePath == lastFile.FilePath)?.Title
-                            ?? $"章节 {totalChapters}";
+                        latestChapter = GetEpubChapterTitle(epub, lastFile.FilePath, totalChapters);
                     }
                 }
                 catch (Exception ex)
@@ -239,6 +238,14 @@ public partial class LocalBookService
         return (fileName, "本地作者");
     }
 
+    private static string GetEpubChapterTitle(EpubBook book, string filePath, int chapterNumber)
+    {
+        var title = book.Navigation?
+            .FirstOrDefault(n => n.Link?.ContentFilePath == filePath)?
+            .Title;
+        return string.IsNullOrWhiteSpace(title) ? $"章节 {chapterNumber}" : title.Trim();
+    }
+
     public List<BookChapter>? GetChapterList(string url)
     {
         var filePath = ResolveLocalPath(url);
@@ -253,7 +260,7 @@ public partial class LocalBookService
                 int idx = 0;
                 foreach (var textFile in book.ReadingOrder)
                 {
-                    string title = book.Navigation?.FirstOrDefault(n => n.Link?.ContentFilePath == textFile.FilePath)?.Title ?? $"章节 {idx + 1}";
+                    string title = GetEpubChapterTitle(book, textFile.FilePath, idx + 1);
                     epubChapters.Add(new BookChapter(title, $"{url}#epub#{textFile.FilePath}", idx++));
                 }
                 return epubChapters;

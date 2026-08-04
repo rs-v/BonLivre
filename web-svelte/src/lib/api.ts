@@ -154,12 +154,15 @@ export const saveReadConfig = (config: ReadConfig) =>
 export const saveBookProgress = (progress: BookProgress) =>
   postJson<string>('saveBookProgress', progress)
 
-/** 页面关闭/切后台时可靠保存进度 */
-export const saveBookProgressWithBeacon = (progress: BookProgress) => {
-  navigator.sendBeacon(
-    withPassword(`${baseUrl}/saveBookProgress`),
-    JSON.stringify(progress),
-  )
+/** 页面关闭/切后台时尽力保存进度；Beacon 无法入队时回退到 keepalive 请求。 */
+export const saveBookProgressWithBeacon = (progress: BookProgress): boolean => {
+  const url = withPassword(`${baseUrl}/saveBookProgress`)
+  const body = JSON.stringify(progress)
+  const queued = navigator.sendBeacon(url, body)
+  if (!queued) {
+    void fetch(url, { method: 'POST', body, keepalive: true }).catch(() => {})
+  }
+  return queued
 }
 
 // ---------- 资源 URL（<img src> 直连，带密码 query） ----------

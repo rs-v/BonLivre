@@ -6,6 +6,7 @@ namespace BonLivre.Services;
 internal sealed class BookProgressStore
 {
     private readonly ILiteCollection<BsonDocument> _progress;
+    private readonly object _saveLock = new();
 
     public BookProgressStore(LiteDbStore store)
     {
@@ -20,16 +21,27 @@ internal sealed class BookProgressStore
             ? $"local://{progress.Name}"
             : progress.BookUrl;
 
-        _progress.Upsert(new BsonDocument
+        lock (_saveLock)
         {
-            ["_id"] = bookUrl,
-            ["name"] = progress.Name,
-            ["author"] = progress.Author,
-            ["durChapterIndex"] = progress.DurChapterIndex,
-            ["durChapterPos"] = progress.DurChapterPos,
-            ["durChapterTime"] = progress.DurChapterTime,
-            ["durChapterTitle"] = progress.DurChapterTitle
-        });
+            var existing = _progress.FindById(bookUrl);
+            if (existing != null &&
+                existing.TryGetValue("durChapterTime", out var savedTime) &&
+                savedTime.AsInt64 > progress.DurChapterTime)
+            {
+                return;
+            }
+
+            _progress.Upsert(new BsonDocument
+            {
+                ["_id"] = bookUrl,
+                ["name"] = progress.Name,
+                ["author"] = progress.Author,
+                ["durChapterIndex"] = progress.DurChapterIndex,
+                ["durChapterPos"] = progress.DurChapterPos,
+                ["durChapterTime"] = progress.DurChapterTime,
+                ["durChapterTitle"] = progress.DurChapterTitle
+            });
+        }
     }
 
     public List<BookProgress> GetAllProgress()
