@@ -15,6 +15,8 @@ export type Book = {
   durChapterIndex: number
   durChapterPos: number
   durChapterTime: number
+  /** 本地书籍文件 mtime 的 Unix 毫秒，由后端 ImportedAt 填充；非本地书籍可能为 0。 */
+  importedAt?: number
   coverUrl?: string
   intro?: string
 }

@@ -49,6 +49,7 @@
     typeof window === 'undefined' || !window.matchMedia('(max-width: 750px)').matches,
   )
   let customFontInput = $state('')
+  let isFullscreen = $state(false)
   let contentEl = $state<HTMLElement | null>(null)
   let bottomSentinel = $state<HTMLElement | null>(null)
   let catalogListEl = $state<HTMLElement | null>(null)
@@ -493,13 +494,18 @@
       if (document.visibilityState === 'hidden') flushProgress()
     }
     const onPageHide = () => flushProgress()
+    const onFullscreenChange = () => {
+      isFullscreen = document.fullscreenElement !== null
+    }
     document.addEventListener('visibilitychange', onVisibilityChange)
     window.addEventListener('pagehide', onPageHide)
     window.addEventListener('keydown', handleKey)
+    document.addEventListener('fullscreenchange', onFullscreenChange)
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange)
       window.removeEventListener('pagehide', onPageHide)
       window.removeEventListener('keydown', handleKey)
+      document.removeEventListener('fullscreenchange', onFullscreenChange)
       flushProgress()
     }
   })
@@ -571,6 +577,31 @@
     reading.config.font = -1
     reading.config.customFontName = customFontInput.trim()
     saveConfig()
+  }
+
+  /** 切换浏览器全屏（Fullscreen API，带 webkit 前缀回退）；不支持或被拒则静默。 */
+  const toggleFullscreen = async () => {
+    try {
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null
+        webkitExitFullscreen?: () => Promise<void>
+      }
+      const el = contentEl as HTMLElement | null
+      const root = (el ?? document.documentElement) as HTMLElement & {
+        webkitRequestFullscreen?: () => Promise<void>
+      }
+      const inFs = document.fullscreenElement || doc.webkitFullscreenElement
+      if (inFs) {
+        if (document.exitFullscreen) await document.exitFullscreen()
+        else if (doc.webkitExitFullscreen) await doc.webkitExitFullscreen()
+      } else if (root.requestFullscreen) {
+        await root.requestFullscreen()
+      } else if (root.webkitRequestFullscreen) {
+        await root.webkitRequestFullscreen()
+      }
+    } catch {
+      /* 用户手势/权限不足等场景静默忽略 */
+    }
   }
 
   /** 数值设置项微调工具 */
@@ -789,6 +820,26 @@
           <path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z" />
         </svg>
         <span class="label-medium">书架</span>
+      </button>
+      <button
+        class="bar-item"
+        onclick={toggleFullscreen}
+        aria-label={isFullscreen ? '退出全屏' : '进入全屏'}
+      >
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+          {#if isFullscreen}
+            <!-- 退出全屏 -->
+            <path
+              d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"
+            />
+          {:else}
+            <!-- 进入全屏 -->
+            <path
+              d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7v-3h-2v5h5v-2h-3zM14 5v2h3v3h2V5h-5z"
+            />
+          {/if}
+        </svg>
+        <span class="label-medium">{isFullscreen ? '退出' : '全屏'}</span>
       </button>
       <button
         class="bar-item"
@@ -1637,11 +1688,11 @@
       grid-column: 1 / -1;
     }
 
-    /* 10 个操作使用两行网格，保证窄屏点击目标不会过小或横向滚动。 */
+    /* 11 个操作使用两行网格，保证窄屏点击目标不会过小或横向滚动。 */
     .bottom-app-bar {
       height: var(--reader-action-bar-height);
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       grid-template-rows: repeat(2, 52px);
       gap: 0;
       padding: 4px 6px calc(4px + env(safe-area-inset-bottom, 0px));

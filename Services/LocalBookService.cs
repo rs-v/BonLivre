@@ -192,7 +192,8 @@ public partial class LocalBookService
                 OriginName: isEpub ? "EPUB" : "本地导入",
                 Intro: intro,
                 TotalChapterNum: totalChapters,
-                LatestChapterTitle: latestChapter
+                LatestChapterTitle: latestChapter,
+                ImportedAt: new DateTimeOffset(new FileInfo(file).LastWriteTimeUtc).ToUnixTimeMilliseconds()
             );
             bookshelf.Add(book);
         }

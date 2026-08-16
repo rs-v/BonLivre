@@ -24,6 +24,8 @@ public record Book(
     int Order = 0,
     int OriginOrder = 0,
     long SyncTime = 0,
+    // 本地书籍文件 LastWriteTimeUtc 的 Unix 毫秒，与 DurChapterTime 同口径，供前端按导入时间排序。
+    long ImportedAt = 0,
     string? CoverUrl = null,
     string? Intro = ""
 );

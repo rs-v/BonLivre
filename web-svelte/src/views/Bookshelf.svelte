@@ -6,7 +6,14 @@
   import { startReading, loadConfig, lastReadBook } from '../lib/reader.svelte'
   import { colorScheme, cycleColorScheme } from '../lib/colorScheme.svelte'
   import BookCard from '../components/BookCard.svelte'
+  import BookGridCard from '../components/BookGridCard.svelte'
   import ConnectDialog from '../components/ConnectDialog.svelte'
+
+  type ShelfView = 'list' | 'grid'
+  type ShelfSort = 'recent' | 'imported'
+
+  const SHELF_VIEW_KEY = 'shelfView'
+  const SHELF_SORT_KEY = 'shelfSort'
 
   let shelf = $state<Book[]>([])
   let searchResults = $state<SearchBook[]>([])
@@ -17,11 +24,44 @@
   let connectDialogOpen = $state(false)
   let uploading = $state(false)
 
+  let shelfView = $state<ShelfView>(
+    localStorage.getItem(SHELF_VIEW_KEY) === 'grid' ? 'grid' : 'list',
+  )
+  let shelfSort = $state<ShelfSort>(
+    localStorage.getItem(SHELF_SORT_KEY) === 'imported' ? 'imported' : 'recent',
+  )
+
+  const toggleShelfView = () => {
+    shelfView = shelfView === 'list' ? 'grid' : 'list'
+    localStorage.setItem(SHELF_VIEW_KEY, shelfView)
+  }
+
+  const cycleShelfSort = () => {
+    shelfSort = shelfSort === 'recent' ? 'imported' : 'recent'
+    localStorage.setItem(SHELF_SORT_KEY, shelfSort)
+  }
+
+  const shelfSortLabel = $derived(
+    shelfSort === 'recent' ? '最近阅读' : '导入时间',
+  )
+
+  // 书架按选定维度排序；在线搜索结果（SearchBook 无时间字段）保持后端返回顺序。
+  const sortedShelf = $derived.by<Book[]>(() => {
+    if (shelfSort === 'imported') {
+      return shelf.toSorted((a, b) => {
+        const diff = (b.importedAt ?? 0) - (a.importedAt ?? 0)
+        if (diff !== 0) return diff
+        return a.name.localeCompare(b.name, 'zh')
+      })
+    }
+    return shelf.toSorted((a, b) => b.durChapterTime - a.durChapterTime)
+  })
+
   // 本地过滤：搜索词非空但未触发在线搜索时，按书名/作者过滤书架
   const visibleBooks = $derived.by<(Book | SearchBook)[]>(() => {
     if (searching) return searchResults
-    if (!searchWord) return shelf
-    return shelf.filter(
+    if (!searchWord) return sortedShelf
+    return sortedShelf.filter(
       b => b.name.includes(searchWord) || b.author.includes(searchWord),
     )
   })
@@ -31,8 +71,7 @@
     try {
       const resp = await api.getBookshelf()
       if (resp.isSuccess) {
-        // 按最近阅读时间排序，最近读的在前
-        shelf = resp.data.toSorted((a, b) => b.durChapterTime - a.durChapterTime)
+        shelf = resp.data
         connected = true
       } else {
         toast(resp.errorMsg, 'error')
@@ -152,6 +191,38 @@
   <header class="top-app-bar">
     <span class="app-title title-large">阅读</span>
     <button
+      class="btn-icon sort-btn"
+      title={`排序：${shelfSortLabel}`}
+      aria-label="切换书库排序"
+      onclick={cycleShelfSort}
+    >
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+        <path
+          d="M3 6h13v2H3V6zm0 5h10v2H3v-2zm0 5h7v2H3v-2zm17-2.5 3.5 3.5-1.4 1.4-1.1-1.1V20h-2v-3.7l-1.1 1.1-1.4-1.4 3.5-3.5z"
+        />
+      </svg>
+    </button>
+    <button
+      class="btn-icon view-btn"
+      title={shelfView === 'list' ? '视图：列表' : '视图：宫格'}
+      aria-label="切换书库视图"
+      onclick={toggleShelfView}
+    >
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+        {#if shelfView === 'list'}
+          <!-- 列表 -->
+          <path
+            d="M3 5h18v2H3V5zm0 6h18v2H3v-2zm0 6h18v2H3v-2z"
+          />
+        {:else}
+          <!-- 宫格 -->
+          <path
+            d="M3 3h7v7H3V3zm11 0h7v7h-7V3zM3 14h7v7H3v-7zm11 0h7v7h-7v-7z"
+          />
+        {/if}
+      </svg>
+    </button>
+    <button
       class="btn-icon scheme-toggle"
       title={colorScheme.mode === 'auto'
         ? '配色：跟随系统'
@@ -234,13 +305,21 @@
         {searching ? '搜索中…' : '书架空空如也，点击右下角 + 导入书籍'}
       </div>
     {:else}
-      <div class="grid">
+      <div class="grid" class:grid-cover={shelfView === 'grid'}>
         {#each visibleBooks as book (book.bookUrl)}
-          <BookCard
-            {book}
-            onclick={() => openBook(book)}
-            ondelete={searching ? undefined : () => removeBook(book as Book)}
-          />
+          {#if shelfView === 'grid'}
+            <BookGridCard
+              {book}
+              onclick={() => openBook(book)}
+              ondelete={searching ? undefined : () => removeBook(book as Book)}
+            />
+          {:else}
+            <BookCard
+              {book}
+              onclick={() => openBook(book)}
+              ondelete={searching ? undefined : () => removeBook(book as Book)}
+            />
+          {/if}
         {/each}
       </div>
     {/if}
@@ -297,6 +376,16 @@
   .top-app-bar .scheme-toggle {
     position: absolute;
     right: 60px;
+  }
+
+  .top-app-bar .view-btn {
+    position: absolute;
+    right: 108px;
+  }
+
+  .top-app-bar .sort-btn {
+    position: absolute;
+    right: 156px;
   }
 
   .search-row {
@@ -371,6 +460,11 @@
     margin: 0 auto;
   }
 
+  .grid.grid-cover {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 16px;
+  }
+
   /* grid 项默认 min-width:auto，卡片内 nowrap 文本会把卡片撑出视口；置 0 允许收缩出省略号 */
   .grid > :global(*) {
     min-width: 0;
@@ -411,6 +505,11 @@
 
     .grid {
       grid-template-columns: 1fr;
+    }
+
+    .grid.grid-cover {
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 12px;
     }
   }
 </style>
