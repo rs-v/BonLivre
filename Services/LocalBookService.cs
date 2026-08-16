@@ -41,8 +41,16 @@ public partial class LocalBookService
         return book;
     }
 
-    /// <summary>TXT 全文与章节切分的缓存条目。目录与正文请求共用，避免每次翻页重读全文、重跑章节正则。</summary>
-    private sealed record TxtBookCache(DateTime LastWriteUtc, long FileLength, string Content, List<TxtChapterSpan> Spans);
+    /// <summary>
+    /// TXT 章节切分结果（缓存条目）。不缓存整本解码后的 string——只缓存编码与按字节偏移组织的章节区间，
+    /// 读章正文时按 Span 的字节范围 seek + Decoder 流式解码，避免几十 MB 的整本 string 常驻内存。
+    /// </summary>
+    private sealed record TxtBookCache(
+        DateTime LastWriteUtc,
+        long FileLength,
+        Encoding Encoding,
+        int BomLength,
+        List<TxtChapterSpan> Spans);
 
     private static TxtBookCache GetOrAddTxt(string filePath)
     {
@@ -52,8 +60,11 @@ public partial class LocalBookService
         {
             return cached;
         }
-        var content = ReadTextAutoEncoding(filePath);
-        var entry = new TxtBookCache(info.LastWriteTimeUtc, info.Length, content, BuildTxtChapters(content));
+        var (encoding, bomLength, content) = ReadTextAutoEncoding(filePath);
+        // 切分在解码后的整本 string 上做（启发式需全文扫描，无法不读），
+        // 但完成后不再保留整本 string——只把 char 索引翻译成字节偏移存进 Span。
+        var spans = BuildTxtChaptersWithByteOffsets(content, encoding, bomLength);
+        var entry = new TxtBookCache(info.LastWriteTimeUtc, info.Length, encoding, bomLength, spans);
         _txtCache[filePath] = entry;
         return entry;
     }
@@ -75,30 +86,31 @@ public partial class LocalBookService
     /// 读取文本文件并自动识别编码：先看 BOM（UTF-8/UTF-16LE/BE），无 BOM 时尝试严格 UTF-8
     /// 解码，失败则按 GB18030（兼容 GBK/GB2312，中文 TXT 最常见的非 UTF-8 编码）解码。
     /// 都不行时回退宽松 UTF-8，乱码总好过 500。
+    /// 返回 (解码用 Encoding, BOM 长度, 解码后的整本 string)。BOM 长度用于后续按字节范围 seek 时跳过头部。
     /// </summary>
-    private static string ReadTextAutoEncoding(string filePath)
+    private static (Encoding Encoding, int BomLength, string Content) ReadTextAutoEncoding(string filePath)
     {
         var bytes = File.ReadAllBytes(filePath);
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+            return (StrictUtf8, 3, Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3));
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
-            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+            return (Encoding.Unicode, 2, Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2));
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
-            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+            return (Encoding.BigEndianUnicode, 2, Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2));
 
         try
         {
-            return StrictUtf8.GetString(bytes);
+            return (StrictUtf8, 0, StrictUtf8.GetString(bytes));
         }
         catch (DecoderFallbackException)
         {
             var gb = Gb18030.Value;
             if (gb != null)
             {
-                try { return gb.GetString(bytes); }
+                try { return (gb, 0, gb.GetString(bytes)); }
                 catch (DecoderFallbackException) { }
             }
-            return Encoding.UTF8.GetString(bytes);
+            return (Encoding.UTF8, 0, Encoding.UTF8.GetString(bytes));
         }
     }
 
@@ -314,7 +326,126 @@ public partial class LocalBookService
 
         var txt = GetOrAddTxt(filePath);
         if (index < 0 || index >= txt.Spans.Count) return null;
-        return txt.Content.Substring(txt.Spans[index].Start, txt.Spans[index].Length);
+        return ReadChapterSpan(filePath, txt, txt.Spans[index]);
+    }
+
+    /// <summary>
+    /// 流式写出章节正文（JSON 字符串片段形式）到 chunkWriter：把章正文按块解码，
+    /// 逐块回调（调用方负责 JSON 转义与 flush）。支持 EPUB 与 TXT：
+    ///  - TXT：按 Span 字节范围 seek + Decoder 流式解码，不读整本、不拼整章 string；
+    ///  - EPUB：解析出整章 string 后切块回调（单章 HTML 解析本就不大）。
+    /// 返回 false 表示无内容或解析失败（端点按 legado 兼容回退模拟正文）。
+    /// </summary>
+    public async Task<bool> StreamChapterContentAsync(
+        string url, int index, Func<ReadOnlyMemory<char>, CancellationToken, Task> chunkWriter, CancellationToken ct)
+    {
+        var filePath = ResolveLocalPath(url);
+        if (filePath == null || !File.Exists(filePath)) return false;
+
+        if (filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var epubParts = url.Split("#epub#", StringSplitOptions.RemoveEmptyEntries);
+                var targetFile = epubParts.Length > 1 ? epubParts[1] : null;
+                var book = GetOrAddEpub(filePath);
+                var textFile = targetFile == null
+                    ? index >= 0 && index < book.ReadingOrder.Count ? book.ReadingOrder[index] : null
+                    : book.ReadingOrder.FirstOrDefault(file => file.FilePath == targetFile);
+                if (textFile == null) return false;
+                var text = ExtractEpubChapterText(textFile.Content, textFile.FilePath).AsMemory();
+                const int ChunkChars = 8192;
+                for (int off = 0; off < text.Length; off += ChunkChars)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var len = Math.Min(ChunkChars, text.Length - off);
+                    await chunkWriter(text.Slice(off, len), ct).ConfigureAwait(false);
+                }
+                return true;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"EPUB Content Error: {ex.Message}");
+                return false;
+            }
+        }
+
+        if (!filePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return false;
+        var txt = GetOrAddTxt(filePath);
+        if (index < 0 || index >= txt.Spans.Count) return false;
+        await ReadChapterSpanAsync(filePath, txt, txt.Spans[index], chunkWriter, ct).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>按 Span 字节范围 seek 并用 Decoder 流式解码整章正文为 string。用于搜索等需要整章文本的场景。</summary>
+    private static string ReadChapterSpan(string filePath, TxtBookCache txt, TxtChapterSpan span)
+    {
+        var sb = new StringBuilder(checked((int)span.ContentLength + 16));
+        ReadChapterSpanAsync(filePath, txt, span,
+            (mem, _) => { sb.Append(mem.Span); return Task.CompletedTask; }, CancellationToken.None).GetAwaiter().GetResult();
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 按 Span 的字节范围从文件 seek 读取，用 Decoder 分块解码，逐块回调 chunkWriter。
+    /// Decoder 跨块保留状态，正确处理 GB18030/UTF-16 多字节序列跨块边界。
+    /// Span.Start 已是含 BOM 的文件绝对偏移（切分时加上 BomLength），故直接 seek。
+    /// </summary>
+    private static async Task ReadChapterSpanAsync(
+        string filePath, TxtBookCache txt, TxtChapterSpan span,
+        Func<ReadOnlyMemory<char>, CancellationToken, Task> chunkWriter, CancellationToken ct)
+    {
+        // 章节区间可能为 0（卷标题空区间被保留时），直接返回空。
+        if (span.Length <= 0) return;
+
+        const int ByteChunk = 65536;
+        var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: ByteChunk, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+        try
+        {
+            fs.Seek(span.Start, SeekOrigin.Begin);
+            var decoder = txt.Encoding.GetDecoder();
+            var byteBuf = new byte[ByteChunk];
+            // 最坏 4 字节/char；给足空间避免 Convert 因输出缓冲不足而多次往返。
+            var charBuf = new char[ByteChunk];
+            long remaining = span.Length;
+            bool last = false;
+
+            while (remaining > 0 && !last)
+            {
+                ct.ThrowIfCancellationRequested();
+                int want = (int)Math.Min(byteBuf.Length, remaining);
+                int read = await fs.ReadAsync(byteBuf.AsMemory(0, want), ct).ConfigureAwait(false);
+                if (read <= 0) break;
+                remaining -= read;
+                last = remaining <= 0;
+
+                int bytePos = 0;
+                while (bytePos < read)
+                {
+                    decoder.Convert(byteBuf, bytePos, read - bytePos,
+                        charBuf, 0, charBuf.Length,
+                        flush: last, out int bytesUsed, out int charsUsed, out _);
+                    if (charsUsed > 0)
+                        await chunkWriter(charBuf.AsMemory(0, charsUsed), ct).ConfigureAwait(false);
+                    bytePos += bytesUsed;
+                    // 极端情况下既没消费字节也没产出字符：避免死循环。
+                    if (bytesUsed == 0 && charsUsed == 0) break;
+                }
+            }
+
+            // flush 收尾：Decoder 可能还有未完成的多字节序列需要冲刷。最后一轮 Convert 已传 flush=last，
+            // 但若末块因输出缓冲边界未冲完，这里再补一次空输入 flush。
+            decoder.Convert(byteBuf, 0, 0, charBuf, 0, charBuf.Length,
+                flush: true, out _, out int tailChars, out _);
+            if (tailChars > 0)
+                await chunkWriter(charBuf.AsMemory(0, tailChars), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            await fs.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>搜索本地书籍已渲染的正文，返回可直接用于阅读器跳转的章内位置。</summary>
@@ -346,7 +477,7 @@ public partial class LocalBookService
             {
                 var span = txt.Spans[index];
                 AddChapterMatches(results, index, span.Title,
-                    txt.Content.Substring(span.Start, span.Length), key, maxResults);
+                    ReadChapterSpan(filePath, txt, span), key, maxResults);
             }
             return results;
         }
@@ -409,11 +540,15 @@ public partial class LocalBookService
         return $"{(start > 0 ? "…" : "")}{line[start..end]}{(end < line.Length ? "…" : "")}";
     }
 
-    /// <summary>TXT 章节切分结果：标题、原文区间、分卷标记，以及与阅读进度同口径的正文长度。</summary>
+    /// <summary>
+    /// TXT 章节切分结果：标题、原文区间（字节偏移与字节长度，已含 BOM 调整）、分卷标记，
+    /// 以及与阅读进度同口径的正文长度（char 计数，在切分时一次性算好，读章时不再重算）。
+    /// Start/Length 是文件内**逻辑字节偏移**（不含 BOM，调用方 seek 时加上缓存里的 BomLength）。
+    /// </summary>
     private readonly record struct TxtChapterSpan(
         string Title,
-        int Start,
-        int Length,
+        long Start,
+        long Length,
         bool IsVolume,
         int ContentLength);
 
@@ -445,7 +580,90 @@ public partial class LocalBookService
     ///  1. 分隔符边界：当编号类命中稀少时，用水平分隔线（===== / ------- 等）补章；
     ///  2. 模式一致性 + 回填：取出现次数最多的编号模式，回填符合该模式的漏判短行；
     ///  3. 空章合并：非卷空区间（两个普通标题紧邻、中间无正文）删除，避免目录出现点进去只有标题的项。
+    ///
+    /// 切分在解码后的整本 string 上做（char 索引），返回前调用 CharOffsetsToByteOffsets 把每个
+    /// Span 的 char 偏移翻译成文件字节偏移——Span 的 Start/Length 最终是字节口径，
+    /// 读章正文时按字节范围 seek 流式解码。整本 string 在本方法返回后即由调用方丢弃，不再常驻。
     /// </summary>
+    private static List<TxtChapterSpan> BuildTxtChaptersWithByteOffsets(
+        string content, Encoding encoding, int bomLength)
+    {
+        var charSpans = BuildTxtChapters(content);
+        if (charSpans.Count == 0) return charSpans;
+
+        // 把整本按 char 块编码，累计每个块起点的字节偏移，构成采样点表。
+        // Span 的 char 起点/终点据此映射为字节偏移：采样点对齐处直接取值，块内小段重新编码补差。
+        var map = BuildCharToByteMap(content, encoding);
+
+        var result = new List<TxtChapterSpan>(charSpans.Count);
+        for (int i = 0; i < charSpans.Count; i++)
+        {
+            var s = charSpans[i];
+            long byteStart = ResolveByteOffset(content, map, (int)s.Start, encoding);
+            long byteEnd = ResolveByteOffset(content, map, (int)(s.Start + s.Length), encoding);
+            result.Add(s with { Start = bomLength + byteStart, Length = byteEnd - byteStart });
+        }
+        return result;
+    }
+
+    /// <summary>char 偏移 → 字节偏移的采样点表（按 char 块边界建立，不含 BOM）。</summary>
+    private sealed record CharToByteSample(int CharIndex, long ByteIndex);
+
+    /// <summary>
+    /// 把整本 content 按固定 char 块编码，记录每个块起点的 (char 偏移, 字节偏移)。
+    /// 用 Encoder 维护状态以正确处理 GB18030/UTF-16 多字节跨块（块边界理想下不切断序列，Encoder 兜底）。
+    /// 采样点表大小约 content.Length / CharChunk，远小于逐 char 的表。
+    /// </summary>
+    private static List<CharToByteSample> BuildCharToByteMap(string content, Encoding encoding)
+    {
+        const int CharChunk = 8192;
+        var samples = new List<CharToByteSample>(content.Length / CharChunk + 2);
+        var encoder = encoding.GetEncoder();
+        var charBuf = new char[CharChunk];
+        var byteBuf = new byte[CharChunk * 4]; // 最坏 4 字节/char
+        long byteOffset = 0;
+        int pos = 0;
+        samples.Add(new CharToByteSample(0, 0));
+        while (pos < content.Length)
+        {
+            int take = Math.Min(CharChunk, content.Length - pos);
+            content.CopyTo(pos, charBuf, 0, take);
+            encoder.Convert(charBuf, 0, take, byteBuf, 0, byteBuf.Length,
+                flush: pos + take >= content.Length, out _, out int bytesUsed, out _);
+            pos += take;
+            byteOffset += bytesUsed;
+            if (pos < content.Length)
+                samples.Add(new CharToByteSample(pos, byteOffset));
+        }
+        samples.Add(new CharToByteSample(content.Length, byteOffset));
+        return samples;
+    }
+
+    /// <summary>
+    /// 在采样点表上二分定位 char 偏移对应的字节偏移（不含 BOM）。采样点对齐处直接取值；
+    /// 落在采样点之间时，从最近采样点起对该小段（≤ CharChunk 个 char）重新编码补差。
+    /// </summary>
+    private static long ResolveByteOffset(
+        string content, List<CharToByteSample> map, int charIndex, Encoding encoding)
+    {
+        if (charIndex <= 0) return 0;
+        if (charIndex >= content.Length) return map[^1].ByteIndex;
+
+        int lo = 0, hi = map.Count - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            if (map[mid].CharIndex <= charIndex) lo = mid;
+            else hi = mid - 1;
+        }
+        var sample = map[lo];
+        if (sample.CharIndex == charIndex) return sample.ByteIndex;
+
+        // 段内小段重新编码补差。段长 ≤ CharChunk，GetByteCount 在小块上开销可接受。
+        int spanChars = charIndex - sample.CharIndex;
+        return sample.ByteIndex + encoding.GetByteCount(content, sample.CharIndex, spanChars);
+    }
+
     private static List<TxtChapterSpan> BuildTxtChapters(string content)
     {
         var matches = ChapterHeadingRegex().Matches(content);

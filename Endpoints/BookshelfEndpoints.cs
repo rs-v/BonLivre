@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using Microsoft.AspNetCore.Mvc;
 using BonLivre.Models;
 using BonLivre.Services;
@@ -379,18 +380,92 @@ public static class BookshelfEndpoints
             return Results.Json(new LeagdoApiResponse<List<BookChapter>>(true, "", mockChapters), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter);
         });
 
-        app.MapGet("/getBookContent", (string url, int index) =>
+        // 分块流式写出正文：手写 JSON 到响应流，章正文逐块做 JSON 字符串转义后 flush，
+        // 避免 Results.Json 把整章 string 整体缓冲成大 byte[]。对前端透明（fetch().json() 自动拼合 chunked）。
+        app.MapGet("/getBookContent", async (HttpContext ctx, string url, int index) =>
         {
             if (url.StartsWith("local://"))
             {
-                var content = localService.GetBookContent(url, index);
-                if (content != null)
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                var ct = ctx.RequestAborted;
+                await using var stream = ctx.Response.Body;
+                // 先写 JSON 头部 {"isSuccess":true,"errorMsg":"","data":"，再逐块转义写正文，最后写 "}。
+                // 一旦开始流式写正文就不能再换走 Results.Json（响应已提交），故把「是否成功」的判定
+                // 提前到首块写出之前：先尝试取首块，取不到再回退。
+                var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                var wroteHeader = false;
+                try
                 {
-                    return Results.Json(new LeagdoApiResponse<string>(true, "", content), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+                    var ok = await localService.StreamChapterContentAsync(
+                        url, index,
+                        async (chunk, token) =>
+                        {
+                            if (!wroteHeader)
+                            {
+                                // 首块到来前先确认响应未提交：此时 Content-Length 未设，Kestrel 自动 chunked。
+                                await writer.WriteAsync("{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"".AsMemory(), token).ConfigureAwait(false);
+                                wroteHeader = true;
+                            }
+                            token.ThrowIfCancellationRequested();
+                            WriteEscapedJsonStringChunk(writer, chunk.Span);
+                            await writer.FlushAsync(token).ConfigureAwait(false);
+                        },
+                        ct);
+
+                    if (ok && wroteHeader)
+                    {
+                        await writer.WriteAsync("\"}".AsMemory(), ct).ConfigureAwait(false);
+                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        return;
+                    }
+                    // ok 但未写出任何块（空章节）：补一个空 data。
+                    if (ok)
+                    {
+                        await writer.WriteAsync("{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"\"}".AsMemory(), ct).ConfigureAwait(false);
+                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        return;
+                    }
+                    // ok=false 且尚未提交响应：回退模拟正文。已写头部则不能回退，但 ok=false 时 wroteHeader 必为 false。
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
                 }
             }
-            return Results.Json(new LeagdoApiResponse<string>(true, "", $"这是章节 {index} 的模拟正文内容..."), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            // 非 local:// 或解析失败（响应未提交）：legado 兼容回退（isSuccess 仍为 true，前端不区分真假）。
+            await Results.Json(
+                new LeagdoApiResponse<string>(true, "", $"这是章节 {index} 的模拟正文内容..."),
+                AppJsonSerializerContext.Default.LeagdoApiResponseString)
+                .ExecuteAsync(ctx);
         });
+
+        /// <summary>
+        /// 把一段 char 内容作为 JSON 字符串值的内部片段写出（不含外层引号）：
+        /// 转义 "、\ 与控制字符（&lt; 0x20），其中 \n→\n、\r→\r、\t→\t，其余控制字符走 \uXXXX。
+        /// 与 System.Text.Json 的字符串转义规则保持一致，使拼出的整体 JSON 合法。
+        /// </summary>
+        static void WriteEscapedJsonStringChunk(StreamWriter writer, ReadOnlySpan<char> chunk)
+        {
+            foreach (var ch in chunk)
+            {
+                switch (ch)
+                {
+                    case '"': writer.Write("\\\""); break;
+                    case '\\': writer.Write("\\\\"); break;
+                    case '\b': writer.Write("\\b"); break;
+                    case '\f': writer.Write("\\f"); break;
+                    case '\n': writer.Write("\\n"); break;
+                    case '\r': writer.Write("\\r"); break;
+                    case '\t': writer.Write("\\t"); break;
+                    default:
+                        if (ch < 0x20)
+                            writer.Write("\\u{0:X4}", (int)ch);
+                        else
+                            writer.Write(ch);
+                        break;
+                }
+            }
+        }
 
         app.MapGet("/cover", (string path) =>
         {
