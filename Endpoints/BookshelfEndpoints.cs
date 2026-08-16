@@ -389,10 +389,8 @@ public static class BookshelfEndpoints
                 ctx.Response.ContentType = "application/json; charset=utf-8";
                 var ct = ctx.RequestAborted;
                 await using var stream = ctx.Response.Body;
-                // 先写 JSON 头部 {"isSuccess":true,"errorMsg":"","data":"，再逐块转义写正文，最后写 "}。
-                // 一旦开始流式写正文就不能再换走 Results.Json（响应已提交），故把「是否成功」的判定
-                // 提前到首块写出之前：先尝试取首块，取不到再回退。
-                var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                // 直接用 UTF-8 编码的 byte 缓冲写到响应流，避免 StreamWriter 的同步 Write 路径
+                // （Kestrel 默认禁用同步 IO）。逐块转义后 WriteAsync + FlushAsync。
                 var wroteHeader = false;
                 try
                 {
@@ -403,26 +401,26 @@ public static class BookshelfEndpoints
                             if (!wroteHeader)
                             {
                                 // 首块到来前先确认响应未提交：此时 Content-Length 未设，Kestrel 自动 chunked。
-                                await writer.WriteAsync("{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"".AsMemory(), token).ConfigureAwait(false);
+                                await stream.WriteAsync(JsonHeaderBytes, token).ConfigureAwait(false);
                                 wroteHeader = true;
                             }
                             token.ThrowIfCancellationRequested();
-                            WriteEscapedJsonStringChunk(writer, chunk.Span);
-                            await writer.FlushAsync(token).ConfigureAwait(false);
+                            await WriteEscapedJsonStringChunkAsync(stream, chunk, token).ConfigureAwait(false);
+                            await stream.FlushAsync(token).ConfigureAwait(false);
                         },
                         ct);
 
                     if (ok && wroteHeader)
                     {
-                        await writer.WriteAsync("\"}".AsMemory(), ct).ConfigureAwait(false);
-                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        await stream.WriteAsync(JsonTailBytes, ct).ConfigureAwait(false);
+                        await stream.FlushAsync(ct).ConfigureAwait(false);
                         return;
                     }
                     // ok 但未写出任何块（空章节）：补一个空 data。
                     if (ok)
                     {
-                        await writer.WriteAsync("{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"\"}".AsMemory(), ct).ConfigureAwait(false);
-                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        await stream.WriteAsync(EmptyDataJsonBytes, ct).ConfigureAwait(false);
+                        await stream.FlushAsync(ct).ConfigureAwait(false);
                         return;
                     }
                     // ok=false 且尚未提交响应：回退模拟正文。已写头部则不能回退，但 ok=false 时 wroteHeader 必为 false。
@@ -438,34 +436,6 @@ public static class BookshelfEndpoints
                 AppJsonSerializerContext.Default.LeagdoApiResponseString)
                 .ExecuteAsync(ctx);
         });
-
-        /// <summary>
-        /// 把一段 char 内容作为 JSON 字符串值的内部片段写出（不含外层引号）：
-        /// 转义 "、\ 与控制字符（&lt; 0x20），其中 \n→\n、\r→\r、\t→\t，其余控制字符走 \uXXXX。
-        /// 与 System.Text.Json 的字符串转义规则保持一致，使拼出的整体 JSON 合法。
-        /// </summary>
-        static void WriteEscapedJsonStringChunk(StreamWriter writer, ReadOnlySpan<char> chunk)
-        {
-            foreach (var ch in chunk)
-            {
-                switch (ch)
-                {
-                    case '"': writer.Write("\\\""); break;
-                    case '\\': writer.Write("\\\\"); break;
-                    case '\b': writer.Write("\\b"); break;
-                    case '\f': writer.Write("\\f"); break;
-                    case '\n': writer.Write("\\n"); break;
-                    case '\r': writer.Write("\\r"); break;
-                    case '\t': writer.Write("\\t"); break;
-                    default:
-                        if (ch < 0x20)
-                            writer.Write("\\u{0:X4}", (int)ch);
-                        else
-                            writer.Write(ch);
-                        break;
-                }
-            }
-        }
 
         app.MapGet("/cover", (string path) =>
         {
@@ -518,5 +488,67 @@ public static class BookshelfEndpoints
                 );
             }
         });
+    }
+
+    // {"isSuccess":true,"errorMsg":"","data":"  —— 不含 BOM 的 UTF-8 字节。
+    private static readonly byte[] JsonHeaderBytes = "{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\""u8.ToArray();
+    // "}
+    private static readonly byte[] JsonTailBytes = "\"}"u8.ToArray();
+    // {"isSuccess":true,"errorMsg":"","data":""}
+    private static readonly byte[] EmptyDataJsonBytes = "{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"\"}"u8.ToArray();
+
+    /// <summary>
+    /// 把一段 char 内容作为 JSON 字符串值的内部片段异步写出（不含外层引号）：
+    /// 转义 "、\ 与控制字符（&lt; 0x20），其中 \n→\n、\r→\r、\t→\t，其余控制字符走 \uXXXX。
+    /// 与 System.Text.Json 的字符串转义规则保持一致，使拼出的整体 JSON 合法。
+    /// 全程异步写底层流，兼容 Kestrel 禁用同步 IO。逐字符转义，每个 char 最多 6 字节（\uXXXX），
+    /// 故用一个固定 byte[] 承载单 char 的转义产物后 WriteAsync。
+    /// </summary>
+    private static async Task WriteEscapedJsonStringChunkAsync(Stream stream, ReadOnlyMemory<char> chunk, CancellationToken ct)
+    {
+        var buf = new byte[6];
+        // 按 char 遍历，避免 ReadOnlySpan 跨 await 边界。逐字符取 chunk.Span[i]。
+        for (int i = 0; i < chunk.Length; i++)
+        {
+            var ch = chunk.Span[i];
+            int n = ch switch
+            {
+                '"' => CopyAscii(buf, "\\\""u8),
+                '\\' => CopyAscii(buf, "\\\\"u8),
+                '\b' => CopyAscii(buf, "\\b"u8),
+                '\f' => CopyAscii(buf, "\\f"u8),
+                '\n' => CopyAscii(buf, "\\n"u8),
+                '\r' => CopyAscii(buf, "\\r"u8),
+                '\t' => CopyAscii(buf, "\\t"u8),
+                < (char)0x20 => WriteUnicodeEscape(buf, ch),
+                _ => WriteCharUtf8(buf, ch),
+            };
+            if (n > 0)
+                await stream.WriteAsync(buf.AsMemory(0, n), ct).ConfigureAwait(false);
+        }
+
+        static int CopyAscii(byte[] dst, ReadOnlySpan<byte> src)
+        {
+            src.CopyTo(dst);
+            return src.Length;
+        }
+        static int WriteUnicodeEscape(byte[] dst, char ch)
+        {
+            dst[0] = (byte)'\\'; dst[1] = (byte)'u';
+            int v = ch;
+            for (int i = 5; i >= 2; i--)
+            {
+                int h = v & 0xF;
+                dst[i] = (byte)(h < 10 ? '0' + h : 'A' + h - 10);
+                v >>= 4;
+            }
+            return 6;
+        }
+        static int WriteCharUtf8(byte[] dst, char ch)
+        {
+            // 绝大多数是 BMP 单 char（含中文），按 UTF-8 编码 1~3 字节。
+            Span<char> one = stackalloc char[1] { ch };
+            return Encoding.UTF8.GetBytes(one, dst);
+        }
     }
 }

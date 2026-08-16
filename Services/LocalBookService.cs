@@ -83,6 +83,19 @@ public partial class LocalBookService
     });
 
     /// <summary>
+    /// 给定探测出的编码，返回一个用于「读章正文」的副本：解码采用宽松回退（ReplacementFallback），
+    /// 避免末章残缺的多字节序列或文件局部损坏在 flush 时抛 DecoderFallbackException 导致 500。
+    /// 探测阶段仍用严格回退的实例（StrictUtf8 / Gb18030）来判断编码，二者职责分离。
+    /// </summary>
+    private static Encoding ForReading(Encoding encoding) => encoding switch
+    {
+        UTF8Encoding => new UTF8Encoding(false, throwOnInvalidBytes: false),
+        _ when ReferenceEquals(encoding, Gb18030.Value) || encoding.CodePage == Gb18030.Value?.CodePage
+            => Encoding.GetEncoding("GB18030", EncoderFallback.ReplacementFallback, DecoderFallback.ReplacementFallback),
+        _ => (Encoding)encoding.Clone(),
+    };
+
+    /// <summary>
     /// 读取文本文件并自动识别编码：先看 BOM（UTF-8/UTF-16LE/BE），无 BOM 时尝试严格 UTF-8
     /// 解码，失败则按 GB18030（兼容 GBK/GB2312，中文 TXT 最常见的非 UTF-8 编码）解码。
     /// 都不行时回退宽松 UTF-8，乱码总好过 500。
@@ -391,6 +404,7 @@ public partial class LocalBookService
     /// 按 Span 的字节范围从文件 seek 读取，用 Decoder 分块解码，逐块回调 chunkWriter。
     /// Decoder 跨块保留状态，正确处理 GB18030/UTF-16 多字节序列跨块边界。
     /// Span.Start 已是含 BOM 的文件绝对偏移（切分时加上 BomLength），故直接 seek。
+    /// 解码用 ForReading(encoding) 的宽松回退副本，避免末章残缺多字节序列抛异常。
     /// </summary>
     private static async Task ReadChapterSpanAsync(
         string filePath, TxtBookCache txt, TxtChapterSpan span,
@@ -405,7 +419,7 @@ public partial class LocalBookService
         try
         {
             fs.Seek(span.Start, SeekOrigin.Begin);
-            var decoder = txt.Encoding.GetDecoder();
+            var decoder = ForReading(txt.Encoding).GetDecoder();
             var byteBuf = new byte[ByteChunk];
             // 最坏 4 字节/char；给足空间避免 Convert 因输出缓冲不足而多次往返。
             var charBuf = new char[ByteChunk];
@@ -436,7 +450,8 @@ public partial class LocalBookService
             }
 
             // flush 收尾：Decoder 可能还有未完成的多字节序列需要冲刷。最后一轮 Convert 已传 flush=last，
-            // 但若末块因输出缓冲边界未冲完，这里再补一次空输入 flush。
+            // 但若末块因输出缓冲边界未冲完，这里再补一次空输入 flush。宽松回退下残缺序列替换为 U+FFFD，
+            // 不抛异常。
             decoder.Convert(byteBuf, 0, 0, charBuf, 0, charBuf.Length,
                 flush: true, out _, out int tailChars, out _);
             if (tailChars > 0)
@@ -581,9 +596,9 @@ public partial class LocalBookService
     ///  2. 模式一致性 + 回填：取出现次数最多的编号模式，回填符合该模式的漏判短行；
     ///  3. 空章合并：非卷空区间（两个普通标题紧邻、中间无正文）删除，避免目录出现点进去只有标题的项。
     ///
-    /// 切分在解码后的整本 string 上做（char 索引），返回前调用 CharOffsetsToByteOffsets 把每个
-    /// Span 的 char 偏移翻译成文件字节偏移——Span 的 Start/Length 最终是字节口径，
-    /// 读章正文时按字节范围 seek 流式解码。整本 string 在本方法返回后即由调用方丢弃，不再常驻。
+    /// 切分在解码后的整本 string 上做（char 索引），返回前把每个 Span 的 char 偏移翻译成文件字节偏移
+    /// ——Span 的 Start/Length 最终是字节口径，读章正文时按字节范围 seek 流式解码。
+    /// 整本 string 在本方法返回后即由调用方丢弃，不再常驻。
     /// </summary>
     private static List<TxtChapterSpan> BuildTxtChaptersWithByteOffsets(
         string content, Encoding encoding, int bomLength)
@@ -591,77 +606,42 @@ public partial class LocalBookService
         var charSpans = BuildTxtChapters(content);
         if (charSpans.Count == 0) return charSpans;
 
-        // 把整本按 char 块编码，累计每个块起点的字节偏移，构成采样点表。
-        // Span 的 char 起点/终点据此映射为字节偏移：采样点对齐处直接取值，块内小段重新编码补差。
-        var map = BuildCharToByteMap(content, encoding);
+        // 一次线性扫描同时产出所有 Span 的字节偏移：维护一个游标 cursor，按 Span 的 char 起点/终点
+        // 顺序推进编码累计字节偏移。比「逐 Span 二分采样点 + 段内补差」更简单，且无需采样点表。
+        // Spans 已在 BuildTxtChapters 末尾按 Start 升序产出（hits 先排序再生成区间）。
+        var encoder = encoding.GetEncoder();
+        const int CharChunk = 8192;
+        var charBuf = new char[CharChunk];
+        var byteBuf = new byte[CharChunk * 4]; // 最坏 4 字节/char
+        long byteOffset = 0;
+        int charPos = 0;
+
+        long EncodeTo(int targetCharIndex, bool flushAtEnd)
+        {
+            // 从 charPos 编码到 targetCharIndex，累计字节偏移。块大小受限于 CharChunk。
+            while (charPos < targetCharIndex)
+            {
+                int take = Math.Min(CharChunk, targetCharIndex - charPos);
+                content.CopyTo(charPos, charBuf, 0, take);
+                encoder.Convert(charBuf, 0, take, byteBuf, 0, byteBuf.Length,
+                    flush: flushAtEnd && charPos + take >= targetCharIndex,
+                    out _, out int bytesUsed, out _);
+                charPos += take;
+                byteOffset += bytesUsed;
+            }
+            return byteOffset;
+        }
 
         var result = new List<TxtChapterSpan>(charSpans.Count);
         for (int i = 0; i < charSpans.Count; i++)
         {
             var s = charSpans[i];
-            long byteStart = ResolveByteOffset(content, map, (int)s.Start, encoding);
-            long byteEnd = ResolveByteOffset(content, map, (int)(s.Start + s.Length), encoding);
+            bool isLast = i == charSpans.Count - 1;
+            long byteStart = EncodeTo((int)s.Start, flushAtEnd: false);
+            long byteEnd = EncodeTo((int)(s.Start + s.Length), flushAtEnd: isLast);
             result.Add(s with { Start = bomLength + byteStart, Length = byteEnd - byteStart });
         }
         return result;
-    }
-
-    /// <summary>char 偏移 → 字节偏移的采样点表（按 char 块边界建立，不含 BOM）。</summary>
-    private sealed record CharToByteSample(int CharIndex, long ByteIndex);
-
-    /// <summary>
-    /// 把整本 content 按固定 char 块编码，记录每个块起点的 (char 偏移, 字节偏移)。
-    /// 用 Encoder 维护状态以正确处理 GB18030/UTF-16 多字节跨块（块边界理想下不切断序列，Encoder 兜底）。
-    /// 采样点表大小约 content.Length / CharChunk，远小于逐 char 的表。
-    /// </summary>
-    private static List<CharToByteSample> BuildCharToByteMap(string content, Encoding encoding)
-    {
-        const int CharChunk = 8192;
-        var samples = new List<CharToByteSample>(content.Length / CharChunk + 2);
-        var encoder = encoding.GetEncoder();
-        var charBuf = new char[CharChunk];
-        var byteBuf = new byte[CharChunk * 4]; // 最坏 4 字节/char
-        long byteOffset = 0;
-        int pos = 0;
-        samples.Add(new CharToByteSample(0, 0));
-        while (pos < content.Length)
-        {
-            int take = Math.Min(CharChunk, content.Length - pos);
-            content.CopyTo(pos, charBuf, 0, take);
-            encoder.Convert(charBuf, 0, take, byteBuf, 0, byteBuf.Length,
-                flush: pos + take >= content.Length, out _, out int bytesUsed, out _);
-            pos += take;
-            byteOffset += bytesUsed;
-            if (pos < content.Length)
-                samples.Add(new CharToByteSample(pos, byteOffset));
-        }
-        samples.Add(new CharToByteSample(content.Length, byteOffset));
-        return samples;
-    }
-
-    /// <summary>
-    /// 在采样点表上二分定位 char 偏移对应的字节偏移（不含 BOM）。采样点对齐处直接取值；
-    /// 落在采样点之间时，从最近采样点起对该小段（≤ CharChunk 个 char）重新编码补差。
-    /// </summary>
-    private static long ResolveByteOffset(
-        string content, List<CharToByteSample> map, int charIndex, Encoding encoding)
-    {
-        if (charIndex <= 0) return 0;
-        if (charIndex >= content.Length) return map[^1].ByteIndex;
-
-        int lo = 0, hi = map.Count - 1;
-        while (lo < hi)
-        {
-            int mid = (lo + hi + 1) / 2;
-            if (map[mid].CharIndex <= charIndex) lo = mid;
-            else hi = mid - 1;
-        }
-        var sample = map[lo];
-        if (sample.CharIndex == charIndex) return sample.ByteIndex;
-
-        // 段内小段重新编码补差。段长 ≤ CharChunk，GetByteCount 在小块上开销可接受。
-        int spanChars = charIndex - sample.CharIndex;
-        return sample.ByteIndex + encoding.GetByteCount(content, sample.CharIndex, spanChars);
     }
 
     private static List<TxtChapterSpan> BuildTxtChapters(string content)
