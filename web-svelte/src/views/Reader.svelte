@@ -7,13 +7,14 @@
     bookmarks,
     restoreReading,
     saveProgress,
+    flushProgress,
     saveConfig,
     loadConfig,
     loadBookmarks,
     createCurrentBookmark,
     removeBookmark,
   } from '../lib/reader.svelte'
-  import type { BookContentSearchResult } from '../lib/types'
+  import type { BookChapter, BookContentSearchResult } from '../lib/types'
   import {
     themes,
     themeAt,
@@ -25,6 +26,8 @@
   type Paragraph = { text: string; img?: string; endPos: number }
   type LoadedChapter = { index: number; title: string; paragraphs: Paragraph[] }
   type DrawerTab = 'catalog' | 'bookmarks'
+  type SeekSegment = { chapterIndex: number; start: number; end: number }
+  type SeekMap = { prefixes: number[]; segments: SeekSegment[]; total: number }
 
   // 已加载章节列表：无限加载模式下会持续追加；普通模式始终只有一个元素
   let chapters = $state<LoadedChapter[]>([])
@@ -39,6 +42,9 @@
   let contentSearchLoading = $state(false)
   let contentSearchSubmitted = $state(false)
   let contentSearchRequestId = 0
+  let navigationRequestId = 0
+  let positionTrackingPaused = false
+  let progressPreview = $state<number | null>(null)
   let toolbarVisible = $state(
     typeof window === 'undefined' || !window.matchMedia('(max-width: 750px)').matches,
   )
@@ -55,6 +61,67 @@
   const theme = $derived(themeAt(reading.config.theme))
   const fontFamily = $derived(
     resolveFontFamily(reading.config.font, reading.config.customFontName),
+  )
+
+  const buildSeekMap = (catalog: BookChapter[]): SeekMap | null => {
+    if (catalog.length === 0) return null
+
+    const prefixes: number[] = []
+    const segments: SeekSegment[] = []
+    let total = 0
+    for (let chapterIndex = 0; chapterIndex < catalog.length; chapterIndex++) {
+      const length = catalog[chapterIndex].contentLength
+      if (typeof length !== 'number' || !Number.isInteger(length) || length < 0) return null
+      prefixes.push(total)
+      if (length > 0) {
+        segments.push({ chapterIndex, start: total, end: total + length })
+      }
+      total += length
+      if (!Number.isSafeInteger(total)) return null
+    }
+    return total > 0 ? { prefixes, segments, total } : null
+  }
+
+  const resolveSeekTarget = (map: SeekMap, position: number) => {
+    const target = Math.max(0, Math.min(map.total - 1, Math.round(position)))
+    let low = 0
+    let high = map.segments.length - 1
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2)
+      if (map.segments[mid].end > target) high = mid
+      else low = mid + 1
+    }
+    const segment = map.segments[low]
+    return {
+      position: target,
+      chapterIndex: segment.chapterIndex,
+      chapterPos: target - segment.start,
+    }
+  }
+
+  const seekMap = $derived(buildSeekMap(reading.catalog))
+  const currentBookPosition = $derived.by(() => {
+    if (!seekMap) return 0
+    const chapterIndex = Math.max(0, Math.min(reading.chapterIndex, reading.catalog.length - 1))
+    const chapterLength = reading.catalog[chapterIndex]?.contentLength ?? 0
+    const prefix = seekMap.prefixes[chapterIndex] ?? 0
+    if (chapterLength <= 0) return Math.min(prefix, seekMap.total - 1)
+    return Math.min(
+      seekMap.total - 1,
+      prefix + Math.max(0, Math.min(reading.chapterPos, chapterLength - 1)),
+    )
+  })
+  const displayedBookPosition = $derived(progressPreview ?? currentBookPosition)
+  const displayedSeekTarget = $derived(
+    seekMap ? resolveSeekTarget(seekMap, displayedBookPosition) : null,
+  )
+  const displayedProgressPercent = $derived(
+    seekMap ? ((displayedBookPosition + 1) / seekMap.total) * 100 : 0,
+  )
+  const displayedProgressTitle = $derived(
+    displayedSeekTarget
+      ? (reading.catalog[displayedSeekTarget.chapterIndex]?.title ?? '')
+      : '',
   )
 
   // 段落切分。图片行（后端 ExtractTextWithImages 生成的 <img src="...">）转为图片段。
@@ -80,39 +147,92 @@
     const resp = await api.getBookContent(book.bookUrl, chapter.index)
     if (!resp.isSuccess) {
       toast(resp.errorMsg, 'error')
-      return { index, title: chapter.title, paragraphs: [] }
+      return null
     }
     return { index, title: chapter.title, paragraphs: splitContent(resp.data) }
   }
 
-  /** 跳转到指定章节（替换已加载内容），pos 为章内累计字数 */
-  const loadChapter = async (index: number, pos = 0) => {
+  const resolveChapterPosition = (chapter: LoadedChapter, pos: number) => {
+    if (pos <= 0 || chapter.paragraphs.length === 0) return 0
+
+    let low = 0
+    let high = chapter.paragraphs.length - 1
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2)
+      if (chapter.paragraphs[mid].endPos >= pos) high = mid
+      else low = mid + 1
+    }
+    return chapter.paragraphs[low].endPos
+  }
+
+  const restoreScroll = (chapter: LoadedChapter, pos: number, requestId: number) => {
+    requestAnimationFrame(() => {
+      if (requestId !== navigationRequestId) return
+      if (contentEl) {
+        if (pos <= 0) {
+          contentEl.scrollTop = 0
+        } else {
+          contentEl
+            .querySelector<HTMLElement>(
+              `[data-chapter="${chapter.index}"][data-pos="${pos}"]`,
+            )
+            ?.scrollIntoView({ block: 'start' })
+        }
+      }
+      requestAnimationFrame(() => {
+        if (requestId === navigationRequestId) positionTrackingPaused = false
+      })
+    })
+  }
+
+  /** 跳转到指定章节（替换已加载内容），pos 为章内累计字数。 */
+  const loadChapter = async (index: number, pos = 0): Promise<boolean> => {
+    const requestId = ++navigationRequestId
     contentLoading = true
-    reading.chapterIndex = index
-    reading.chapterPos = pos
-    document.title = reading.catalog[index]?.title ?? document.title
+    positionTrackingPaused = true
+    let restoreScheduled = false
 
     try {
       const loaded = await fetchChapter(index)
-      if (!loaded) return
+      if (requestId !== navigationRequestId || !loaded) return false
+
+      const resolvedPos = resolveChapterPosition(loaded, pos)
       chapters = [loaded]
-      restoreScroll(loaded, pos)
+      reading.chapterIndex = index
+      reading.chapterPos = resolvedPos
+      document.title = reading.catalog[index]?.title ?? document.title
+      restoreScroll(loaded, resolvedPos, requestId)
+      restoreScheduled = true
+      return true
     } catch {
-      toast('获取章节内容失败', 'error')
+      if (requestId === navigationRequestId) toast('获取章节内容失败', 'error')
+      return false
     } finally {
-      contentLoading = false
+      if (requestId === navigationRequestId) {
+        contentLoading = false
+        if (!restoreScheduled) positionTrackingPaused = false
+      }
     }
   }
 
-  /** 无限加载：不清空已读内容，向后追加下一章 */
+  /** 无限加载：不清空已读内容，向后追加下一章。 */
   const loadMore = async () => {
     if (loadingMore || contentLoading) return
     const last = chapters.at(-1)
     if (!last || last.index + 1 >= reading.catalog.length) return
+
+    const requestId = navigationRequestId
+    const expectedLastIndex = last.index
     loadingMore = true
     try {
-      const loaded = await fetchChapter(last.index + 1)
-      if (loaded) chapters = [...chapters, loaded]
+      const loaded = await fetchChapter(expectedLastIndex + 1)
+      if (
+        loaded &&
+        requestId === navigationRequestId &&
+        chapters.at(-1)?.index === expectedLastIndex
+      ) {
+        chapters = [...chapters, loaded]
+      }
     } catch {
       /* 滚动重新触发时重试 */
     } finally {
@@ -120,27 +240,12 @@
     }
   }
 
-  const restoreScroll = (chapter: LoadedChapter, pos: number) => {
-    requestAnimationFrame(() => {
-      if (!contentEl) return
-      if (pos <= 0) {
-        contentEl.scrollTop = 0
-        return
-      }
-      const target = chapter.paragraphs.find(p => p.endPos >= pos)
-      contentEl
-        .querySelector<HTMLElement>(
-          `[data-chapter="${chapter.index}"][data-pos="${target?.endPos}"]`,
-        )
-        ?.scrollIntoView({ block: 'start' })
-    })
-  }
-
   // 滚动时用 IntersectionObserver 跟踪阅读位置（章节序号 + 章内字数）
   $effect(() => {
     if (!contentEl || chapters.length === 0) return
     const observer = new IntersectionObserver(
       entries => {
+        if (positionTrackingPaused) return
         for (const entry of entries) {
           if (!entry.isIntersecting) continue
           const el = entry.target as HTMLElement
@@ -152,7 +257,7 @@
             document.title = reading.catalog[chapterIdx]?.title ?? document.title
           }
           reading.chapterPos = pos
-          saveProgress(60_000)
+          void saveProgress(60_000)
         }
       },
       { root: contentEl, rootMargin: '0px 0px -80% 0px' },
@@ -224,18 +329,35 @@
     toChapter(result.chapterIndex, result.chapterPos)
   }
 
-  const toChapter = (index: number, pos = 0) => {
+  const toChapter = async (index: number, pos = 0): Promise<boolean> => {
     if (index < 0) {
       toast('本章是第一章', 'error')
-      return
+      return false
     }
     if (index >= reading.catalog.length) {
       toast('本章是最后一章', 'error')
-      return
+      return false
     }
     catalogOpen = false
-    loadChapter(index, pos)
-    saveProgress()
+    const loaded = await loadChapter(index, pos)
+    if (loaded) void saveProgress()
+    return loaded
+  }
+
+  const previewProgressSeek = (event: Event) => {
+    const value = (event.currentTarget as HTMLInputElement).valueAsNumber
+    if (!Number.isNaN(value)) progressPreview = Math.round(value)
+  }
+
+  const commitProgressSeek = async (event: Event) => {
+    const map = seekMap
+    const value = (event.currentTarget as HTMLInputElement).valueAsNumber
+    if (!map || Number.isNaN(value)) return
+
+    const target = resolveSeekTarget(map, value)
+    progressPreview = target.position
+    await toChapter(target.chapterIndex, target.chapterPos)
+    progressPreview = null
   }
 
   const selectDrawerTab = (tab: DrawerTab) => {
@@ -310,6 +432,32 @@
     }
   }
 
+  const resolveInitialChapterIndex = (
+    catalog: BookChapter[],
+    savedIndex: number,
+    savedTitle: string,
+  ) => {
+    const safeIndex = Number.isInteger(savedIndex) ? savedIndex : 0
+    const clampedIndex = Math.max(0, Math.min(safeIndex, catalog.length - 1))
+    const normalizedTitle = savedTitle.trim().toLocaleLowerCase()
+    if (!normalizedTitle) return clampedIndex
+    if (catalog[clampedIndex]?.title.trim().toLocaleLowerCase() === normalizedTitle) {
+      return clampedIndex
+    }
+
+    let closestIndex = -1
+    let closestDistance = Number.POSITIVE_INFINITY
+    for (let index = 0; index < catalog.length; index++) {
+      if (catalog[index].title.trim().toLocaleLowerCase() !== normalizedTitle) continue
+      const distance = Math.abs(index - clampedIndex)
+      if (distance < closestDistance) {
+        closestIndex = index
+        closestDistance = distance
+      }
+    }
+    return closestIndex >= 0 ? closestIndex : clampedIndex
+  }
+
   const init = async () => {
     if (!restoreReading()) {
       navigate('/')
@@ -328,8 +476,12 @@
       void loadBookmarks().then(error => {
         if (error) toast(error, 'error')
       })
-      const index = Math.min(reading.chapterIndex, resp.data.length - 1)
-      await loadChapter(index, reading.chapterPos)
+      const index = resolveInitialChapterIndex(
+        resp.data,
+        reading.chapterIndex,
+        book.durChapterTitle ?? '',
+      )
+      if (await loadChapter(index, reading.chapterPos)) void saveProgress()
     } catch {
       toast('获取目录失败，请检查后端连接', 'error')
     }
@@ -338,14 +490,17 @@
   $effect(() => {
     init()
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') saveProgress()
+      if (document.visibilityState === 'hidden') flushProgress()
     }
+    const onPageHide = () => flushProgress()
     document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('pagehide', onPageHide)
     window.addEventListener('keydown', handleKey)
     return () => {
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('pagehide', onPageHide)
       window.removeEventListener('keydown', handleKey)
-      saveProgress()
+      flushProgress()
     }
   })
 
@@ -379,8 +534,12 @@
       document.removeEventListener('pointerdown', closeOnOutsidePointerDown, true)
   })
 
-  const backToShelf = () => {
-    saveProgress()
+  const backToShelf = async () => {
+    const saved = await saveProgress()
+    if (!saved) {
+      toast('阅读进度保存失败，将在后台重试', 'error')
+      flushProgress()
+    }
     navigate('/')
   }
 
@@ -444,6 +603,7 @@
   style:color={theme.text}
   class:md-dark={reading.config.theme === NIGHT_THEME_INDEX}
   class:toolbar-visible={toolbarVisible}
+  class:book-progress-available={seekMap !== null}
 >
   <!-- MD3 Modal navigation drawer：目录 -->
   {#if catalogOpen}
@@ -598,9 +758,32 @@
     </article>
   </div>
 
-  <!-- MD3 Bottom app bar -->
+  <!-- MD3 Bottom app bar 与 TXT 全书进度 -->
   {#if toolbarVisible}
-    <div class="bottom-app-bar">
+    <div class="reader-controls">
+      {#if seekMap}
+        <div class="book-progress">
+          <span class="book-progress-title label-medium" title={displayedProgressTitle}>
+            {displayedProgressTitle}
+          </span>
+          <input
+            type="range"
+            min="0"
+            max={seekMap.total - 1}
+            step="1"
+            value={displayedBookPosition}
+            aria-label="全书阅读进度"
+            aria-valuetext={`${displayedProgressTitle}，${displayedProgressPercent.toFixed(1)}%`}
+            oninput={previewProgressSeek}
+            onchange={commitProgressSeek}
+            onpointercancel={() => (progressPreview = null)}
+          />
+          <span class="book-progress-percent label-medium">
+            {displayedProgressPercent.toFixed(1)}%
+          </span>
+        </div>
+      {/if}
+      <div class="bottom-app-bar">
       <button class="bar-item" onclick={backToShelf} aria-label="返回书架">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
           <path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z" />
@@ -696,6 +879,7 @@
         </svg>
         <span class="label-medium">{reading.config.theme === NIGHT_THEME_INDEX ? '日间' : '夜间'}</span>
       </button>
+      </div>
     </div>
   {/if}
 
@@ -866,9 +1050,18 @@
 
 <style>
   .reader {
+    --reader-action-bar-height: 72px;
+    --reader-progress-height: 0px;
+    --reader-controls-height: calc(
+      var(--reader-action-bar-height) + var(--reader-progress-height)
+    );
     height: 100%;
     display: flex;
     flex-direction: column;
+  }
+
+  .reader.book-progress-available {
+    --reader-progress-height: 52px;
   }
 
   .content-wrapper {
@@ -878,7 +1071,7 @@
   }
 
   .reader.toolbar-visible .content-wrapper {
-    padding-bottom: 100px;
+    padding-bottom: calc(var(--reader-controls-height) + 28px);
   }
 
   .content {
@@ -920,21 +1113,72 @@
     margin-top: 40px;
   }
 
-  /* Bottom app bar */
-  .bottom-app-bar {
+  /* Bottom app bar 与全书进度 */
+  .reader-controls {
     position: fixed;
+    right: 0;
     bottom: 0;
     left: 0;
-    right: 0;
-    height: 72px;
+    height: var(--reader-controls-height);
     display: flex;
-    justify-content: center;
-    gap: 4px;
-    padding: 6px 8px;
+    flex-direction: column;
     background: var(--md-surface-container);
     color: var(--md-on-surface-variant);
     box-shadow: var(--md-elevation-2);
     z-index: 40;
+  }
+
+  .book-progress {
+    height: var(--reader-progress-height);
+    display: grid;
+    grid-template-columns: minmax(100px, 220px) minmax(160px, 640px) 64px;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 8px 20px;
+    border-bottom: 1px solid var(--md-outline-variant);
+  }
+
+  .book-progress-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .book-progress-percent {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .book-progress input[type='range'] {
+    width: 100%;
+    height: 28px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    accent-color: var(--md-primary);
+  }
+
+  .book-progress input[type='range']:focus {
+    padding: 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .book-progress input[type='range']:focus-visible {
+    outline: 2px solid var(--md-primary);
+    outline-offset: 2px;
+  }
+
+  .bottom-app-bar {
+    height: var(--reader-action-bar-height);
+    display: flex;
+    justify-content: center;
+    gap: 4px;
+    padding: 6px 8px;
     overflow-x: auto;
   }
 
@@ -1143,7 +1387,7 @@
   /* Bottom sheet 设置面板 */
   .sheet {
     position: fixed;
-    bottom: 72px;
+    bottom: 0;
     left: 50%;
     transform: translateX(-50%);
     width: 96%;
@@ -1159,6 +1403,10 @@
     flex-direction: column;
     gap: 4px;
     z-index: 60;
+  }
+
+  .reader.toolbar-visible .sheet {
+    bottom: var(--reader-controls-height);
   }
 
   .sheet-handle {
@@ -1357,6 +1605,14 @@
   }
 
   @media (max-width: 750px) {
+    .reader {
+      --reader-action-bar-height: calc(112px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .reader.book-progress-available {
+      --reader-progress-height: 64px;
+    }
+
     .content {
       padding: 20px 16px;
       border-radius: 0;
@@ -1367,12 +1623,23 @@
     }
 
     .reader.toolbar-visible .content-wrapper {
-      padding-bottom: calc(124px + env(safe-area-inset-bottom, 0px));
+      padding-bottom: calc(var(--reader-controls-height) + 12px);
+    }
+
+    .book-progress {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-rows: 20px 28px;
+      gap: 4px 8px;
+      padding: 6px 12px;
+    }
+
+    .book-progress input[type='range'] {
+      grid-column: 1 / -1;
     }
 
     /* 10 个操作使用两行网格，保证窄屏点击目标不会过小或横向滚动。 */
     .bottom-app-bar {
-      height: calc(112px + env(safe-area-inset-bottom, 0px));
+      height: var(--reader-action-bar-height);
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
       grid-template-rows: repeat(2, 52px);
@@ -1397,7 +1664,7 @@
     }
 
     .reader.toolbar-visible .sheet {
-      bottom: calc(112px + env(safe-area-inset-bottom, 0px));
+      bottom: var(--reader-controls-height);
     }
 
     .drawer {

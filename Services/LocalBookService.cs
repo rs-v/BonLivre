@@ -14,6 +14,14 @@ public partial class LocalBookService
     // 旧缓存若不失效会一直读到替换前的内容。
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime LastWriteUtc, EpubBook Book)> _epubCache = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TxtBookCache> _txtCache = new();
+    private readonly Dictionary<string, UploadLock> _uploadLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _uploadLocksLock = new();
+
+    private sealed class UploadLock
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public int ReferenceCount { get; set; }
+    }
 
     public LocalBookService()
     {
@@ -151,8 +159,7 @@ public partial class LocalBookService
                     if (totalChapters > 0)
                     {
                         var lastFile = epub.ReadingOrder[totalChapters - 1];
-                        latestChapter = epub.Navigation?.FirstOrDefault(n => n.Link?.ContentFilePath == lastFile.FilePath)?.Title
-                            ?? $"章节 {totalChapters}";
+                        latestChapter = GetEpubChapterTitle(epub, lastFile.FilePath, totalChapters);
                     }
                 }
                 catch (Exception ex)
@@ -231,6 +238,14 @@ public partial class LocalBookService
         return (fileName, "本地作者");
     }
 
+    private static string GetEpubChapterTitle(EpubBook book, string filePath, int chapterNumber)
+    {
+        var title = book.Navigation?
+            .FirstOrDefault(n => n.Link?.ContentFilePath == filePath)?
+            .Title;
+        return string.IsNullOrWhiteSpace(title) ? $"章节 {chapterNumber}" : title.Trim();
+    }
+
     public List<BookChapter>? GetChapterList(string url)
     {
         var filePath = ResolveLocalPath(url);
@@ -245,7 +260,7 @@ public partial class LocalBookService
                 int idx = 0;
                 foreach (var textFile in book.ReadingOrder)
                 {
-                    string title = book.Navigation?.FirstOrDefault(n => n.Link?.ContentFilePath == textFile.FilePath)?.Title ?? $"章节 {idx + 1}";
+                    string title = GetEpubChapterTitle(book, textFile.FilePath, idx + 1);
                     epubChapters.Add(new BookChapter(title, $"{url}#epub#{textFile.FilePath}", idx++));
                 }
                 return epubChapters;
@@ -262,7 +277,12 @@ public partial class LocalBookService
         var chapters = new List<BookChapter>(spans.Count);
         for (int i = 0; i < spans.Count; i++)
         {
-            chapters.Add(new BookChapter(spans[i].Title, $"{url}#{i}", i, spans[i].IsVolume));
+            chapters.Add(new BookChapter(
+                spans[i].Title,
+                $"{url}#{i}",
+                i,
+                IsVolume: spans[i].IsVolume,
+                ContentLength: spans[i].ContentLength));
         }
         return chapters;
     }
@@ -388,56 +408,298 @@ public partial class LocalBookService
         return $"{(start > 0 ? "…" : "")}{line[start..end]}{(end < line.Length ? "…" : "")}";
     }
 
-    /// <summary>TXT 章节切分结果：标题、在原文中的起始偏移与长度，以及是否为分卷标题。</summary>
-    private readonly record struct TxtChapterSpan(string Title, int Start, int Length, bool IsVolume);
+    /// <summary>TXT 章节切分结果：标题、原文区间、分卷标记，以及与阅读进度同口径的正文长度。</summary>
+    private readonly record struct TxtChapterSpan(
+        string Title,
+        int Start,
+        int Length,
+        bool IsVolume,
+        int ContentLength);
 
-    // 章节标题正则（逐行匹配）。覆盖三类：
-    //   1. 「第X章/节/回/卷/集/部/篇 …」X 为中文数字或阿拉伯数字；
-    //   2. 无编号的特殊卷目：序/序章/序言/楔子/前言/引子/后记/尾声/番外/外传/终章；
-    //   3. 英文 Chapter N。
-    // 限定整行仅由「标题 + 可选副标题」构成（长度受限），避免正文段落中以「第…章」开头的句子被误判为标题。
+    // 章节标题正则（逐行匹配）。只接受完整物理行，避免正文中提及章节时误切分。
+    // 支持常见中英文编号、卷目、特殊章节名、全角字符、标题包装和 CRLF。
+    //
+    // 相比初版扩展的命名形式：
+    //  - 中文数字 / 阿拉伯数字 + 顿号或点起首（一、标题 / 1. 标题）；
+    //  - 阿拉伯数字 + 空格或 ｜/| 分隔符（1 标题 / 1｜标题），点后紧跟数字则不切（3.14 不算）；
+    //  - 括号包裹编号：（一）/ (1) / [一] / 〔二〕 等全角/半角形式；
+    //  - 装饰符号起首（☆★◆◇▲▼■●○ 等）+ 1~30 字；
+    //  - ◎xxx◎、=== xxx ===、【xxx】、〖xxx〗 等包装；
+    //  - 元信息短词（简介/文案/内容提要/作者的话/导读）；
+    //  - 番外编号：番一 / 番1。
+    // 防误切：纯阿拉伯数字行必须后接「分隔符 + 标题文字」或「行尾」，避免「1980年」「3个人」被当章节；
+    // 阿拉伯数字 + 点后紧跟数字不切（3.14、版本号 1.2.3）。
+    // 元信息短词（序章/楔子/正文/简介…）后缀收紧为必须分隔符（空白或 :：、. 等）才追加文字，
+    // 避免「正文内容」「正文1」这类正文行被短词误吞为标题。
     [GeneratedRegex(
-        @"^[ \t　]*(?<title>(?:第[零一二三四五六七八九十百千万两0-9]{1,9}[章节回卷集部篇](?:[ \t　].{0,30})?|(?:序章|序言|序|楔子|前言|引子|后记|尾声|番外|外传|终章)(?:[ \t　].{0,30})?|(?:Chapter|CHAPTER)[ \t]+[0-9]{1,4}(?:[ \t].{0,30})?))[ \t　]*$",
-        RegexOptions.Multiline)]
+        @"^[ \t　]*(?:【|［|〔|\[|〖|◎|===)?[ \t　]*(?<title>(?:第[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}[ \t　]*(?:(?<volumeUnit>[卷部篇册])|[章节回集话幕])(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|(?<volumePrefix>[卷部篇册])[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|(?:完本感言|作品相关|大结局|Introduction|Prologue|Epilogue|Preface|Afterword|Appendix|序章|序言|序幕|楔子|前言|引子|导言|引言|正文|后记|后序|尾声|终章|结语|番外|外传|附录|跋|简介|文案|内容提要|内容简介|作者的话|导读)(?:(?:[ \t　]+|[:：、.．·\-—–]+)[ \t　]*[^\r\n】\]］〕〗◎]{0,80})?|(?<englishVolume>Book|Part|Volume)[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|Chapter[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|[零〇○一二三四五六七八九十百千万]{1,8}[、．.](?:[ \t　]*[^\r\n]{1,80})?|0*[1-9][0-9]{0,4}[．.](?![0-9０-９])[^\r\n]{0,80}|0*[1-9][0-9]{0,4}(?:[ \t　]+[^\r\n\d｜|]{1,80}|\s*[｜|][^\r\n]{1,80})|[\(（\[［〔〖]\s*(?:[零〇○一二三四五六七八九十百千万]{1,8}|0*[1-9][0-9]{0,4})\s*[\)）\]］〕〗](?:[ \t　]*[^\r\n]{0,80})?|[☆★✦✧✩✪✫✬✭✮✡✯✰◆◇▲△▼▽■□●○♠♣♥♦※][^\r\n]{1,30}|番[ \t　]*(?:[零〇○一二三四五六七八九十百千万]{1,8}|0*[1-9][0-9]{0,4})(?:[ \t　]*[^\r\n]{0,80})?))[ \t　]*(?:】|］|〕|〗|\]|◎)?[ \t　]*(?=\r?$)",
+        RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex ChapterHeadingRegex();
 
-    // 分卷标题（卷/部/篇），前端可据 IsVolume 作层级展示；单独成章的「第X卷」等归为分卷。
-    [GeneratedRegex(@"[卷部篇]")]
-    private static partial Regex VolumeMarkerRegex();
-
     /// <summary>
-    /// 将 TXT 全文按章节标题切分为若干区间。目录与正文共用此方法，保证章节索引一致。
-    /// 规则：无标题命中时整篇作为单章「正文」；首个标题之前若存在非空内容，保留为「前言」章，
-    /// 避免序言/引子被丢弃。
+    /// 将 TXT 全文按章节标题切分为若干区间。目录、正文、搜索和全书进度共用这些区间。
+    /// 无标题命中时整篇作为单章「正文」；首个标题前的非空内容保留为「前言」。
+    ///
+    /// 启发式后处理（在 ChapterHeadingRegex 基础命中之上）：
+    ///  1. 分隔符边界：当编号类命中稀少时，用水平分隔线（===== / ------- 等）补章；
+    ///  2. 模式一致性 + 回填：取出现次数最多的编号模式，回填符合该模式的漏判短行；
+    ///  3. 空章合并：非卷空区间（两个普通标题紧邻、中间无正文）删除，避免目录出现点进去只有标题的项。
     /// </summary>
     private static List<TxtChapterSpan> BuildTxtChapters(string content)
     {
         var matches = ChapterHeadingRegex().Matches(content);
-        var spans = new List<TxtChapterSpan>();
-
-        if (matches.Count == 0)
-        {
-            spans.Add(new TxtChapterSpan("正文", 0, content.Length, false));
-            return spans;
-        }
-
-        // 首个标题之前的正文（序言/前言等），非空则保留为一章
-        int firstStart = matches[0].Index;
-        if (content.AsSpan(0, firstStart).Trim().Length > 0)
-        {
-            spans.Add(new TxtChapterSpan("前言", 0, firstStart, false));
-        }
-
+        var hits = new List<TxtHeadingHit>(matches.Count);
+        var hitSet = new HashSet<int>();
         for (int i = 0; i < matches.Count; i++)
         {
-            int start = matches[i].Index;
-            int end = (i + 1 < matches.Count) ? matches[i + 1].Index : content.Length;
             var title = matches[i].Groups["title"].Value.Trim();
-            bool isVolume = VolumeMarkerRegex().IsMatch(title);
-            spans.Add(new TxtChapterSpan(title, start, end - start, isVolume));
+            bool isVolume = matches[i].Groups["volumeUnit"].Success ||
+                matches[i].Groups["volumePrefix"].Success ||
+                matches[i].Groups["englishVolume"].Success;
+            hits.Add(new TxtHeadingHit(matches[i].Index, title, isVolume));
+            hitSet.Add(matches[i].Index);
         }
 
-        return spans;
+        // 统计带编号的命中，判定主模式（用于回填漏判短行）。
+        // 只对「带编号且非第X章」的模式回填：第X章/Book/Chapter 已由原正则充分覆盖，
+        // 短词（序章/正文…）易误切，不作为回填主模式。
+        var buckets = new Dictionary<string, int>();
+        int numberedHits = 0;
+        foreach (var h in hits)
+        {
+            if (!TxtHeadingHasNumber(h.Title)) continue;
+            numberedHits++;
+            var tag = TxtHeadingPatternTag(h.Title);
+            if (tag == "di" || tag == "word") continue;
+            buckets[tag] = (buckets.TryGetValue(tag, out var c) ? c : 0) + 1;
+        }
+        string mainTag = "other";
+        int mainCount = 0;
+        foreach (var kv in buckets)
+        {
+            if (kv.Value > mainCount) { mainCount = kv.Value; mainTag = kv.Key; }
+        }
+
+        // 1. 分隔符补全：编号类命中 < 3 时启用，避免与编号标题打架。
+        if (numberedHits < 3)
+        {
+            int pos = 0;
+            while (pos < content.Length)
+            {
+                int nl = content.IndexOf('\n', pos);
+                int lineEnd = nl < 0 ? content.Length : nl;
+                var line = content.AsSpan(pos, lineEnd - pos);
+                if (IsSeparatorLine(line) && !hitSet.Contains(pos))
+                {
+                    var title = NextNonEmptyLineTitle(content, nl < 0 ? content.Length : nl + 1, "分隔线");
+                    hits.Add(new TxtHeadingHit(pos, title, false));
+                    hitSet.Add(pos);
+                }
+                if (nl < 0) break;
+                pos = nl + 1;
+            }
+        }
+
+        // 2. 模式回填：主模式 ≥ 5 时，回填符合主模式形态的未命中短行。
+        if (mainCount >= 5)
+        {
+            int pos = 0;
+            while (pos < content.Length)
+            {
+                if (!hitSet.Contains(pos))
+                {
+                    int nl = content.IndexOf('\n', pos);
+                    int lineEnd = nl < 0 ? content.Length : nl;
+                    var t = content.AsSpan(pos, lineEnd - pos).Trim();
+                    if (t.Length >= 2 && t.Length <= 30 && TxtHeadingMatchesPattern(t.ToString(), mainTag))
+                    {
+                        hits.Add(new TxtHeadingHit(pos, t.ToString(), false));
+                        hitSet.Add(pos);
+                    }
+                }
+                int next = content.IndexOf('\n', pos);
+                if (next < 0) break;
+                pos = next + 1;
+            }
+        }
+
+        hits.Sort((a, b) => a.Index.CompareTo(b.Index));
+
+        if (hits.Count == 0)
+        {
+            return new List<TxtChapterSpan>
+            {
+                new("正文", 0, content.Length, false, CalculateContentLength(content.AsSpan())),
+            };
+        }
+
+        var spans = new List<TxtChapterSpan>();
+
+        // 首个标题之前的正文（序言/前言等），非空则保留为一章。
+        int firstStart = hits[0].Index;
+        if (content.AsSpan(0, firstStart).Trim().Length > 0)
+        {
+            spans.Add(new TxtChapterSpan(
+                "前言",
+                0,
+                firstStart,
+                false,
+                CalculateContentLength(content.AsSpan(0, firstStart))));
+        }
+
+        // 3. 生成区间，并把空区间标记为 ContentLength=0。
+        for (int i = 0; i < hits.Count; i++)
+        {
+            int start = hits[i].Index;
+            int end = (i + 1 < hits.Count) ? hits[i + 1].Index : content.Length;
+            var body = content.AsSpan(start, end - start);
+            var contentLength = CalculateContentLength(body);
+            bool hasBody = contentLength > hits[i].Title.Length + 1;
+            spans.Add(new TxtChapterSpan(
+                hits[i].Title,
+                start,
+                end - start,
+                hits[i].IsVolume,
+                hasBody ? contentLength : 0));
+        }
+
+        // 4. 空章合并：非卷空区间删除。卷标题空区间保留（前端按 IsVolume 折叠/样式区分，
+        //    seekMap 会跳过 length<=0 的章节）。
+        for (int i = 0; i < spans.Count;)
+        {
+            if (!spans[i].IsVolume && spans[i].ContentLength == 0)
+            {
+                spans.RemoveAt(i);
+            }
+            else
+            {
+                i++;
+            }
+        }
+
+        return spans.Count > 0
+            ? spans
+            : new List<TxtChapterSpan>
+            {
+                new("正文", 0, content.Length, false, CalculateContentLength(content.AsSpan())),
+            };
+    }
+
+    // 水平分隔线字符集（半角与全角形式）。
+    private const string SeparatorChars = "=*~-_─═▔·•＝＊～＿－";
+
+    /// <summary>
+    /// 判定一行是否为「水平分隔线」：trim 后非空白字符 ≥3，其中分隔符占比 ≥50%，
+    /// 且首尾非空白字符都是分隔符。覆盖 ===== / ------- / === 标题 === / · · · 等形态，
+    /// 同时排除「正文---」「3.14」这类混杂行。
+    /// </summary>
+    private static bool IsSeparatorLine(ReadOnlySpan<char> line)
+    {
+        var t = line.Trim();
+        if (t.Length < 3) return false;
+        int sep = 0, nonws = 0;
+        char first = '\0', last = '\0';
+        for (int i = 0; i < t.Length; i++)
+        {
+            var ch = t[i];
+            if (ch == ' ' || ch == '\t' || ch == '　') continue;
+            nonws++;
+            if (SeparatorChars.Contains(ch)) sep++;
+            if (first == '\0') first = ch;
+            last = ch;
+        }
+        if (nonws < 3) return false;
+        if (sep * 100 < nonws * 50) return false;
+        if (sep < 3) return false;
+        return SeparatorChars.Contains(first) && SeparatorChars.Contains(last);
+    }
+
+    /// <summary>取从 startAt 开始的第一个非空行（trim 后），截断为 ≤40 字作章节标题；无则回退 fallback。</summary>
+    private static string NextNonEmptyLineTitle(string content, int startAt, string fallback)
+    {
+        int pos = startAt;
+        while (pos < content.Length)
+        {
+            int nl = content.IndexOf('\n', pos);
+            int lineEnd = nl < 0 ? content.Length : nl;
+            var t = content.AsSpan(pos, lineEnd - pos).Trim();
+            if (!t.IsEmpty)
+            {
+                return t.Slice(0, Math.Min(40, t.Length)).ToString();
+            }
+            if (nl < 0) break;
+            pos = nl + 1;
+        }
+        return fallback;
+    }
+
+    /// <summary>章节命中临时记录：标题、原文起始位置、是否卷标题。</summary>
+    private readonly record struct TxtHeadingHit(int Index, string Title, bool IsVolume);
+
+    /// <summary>标题是否带编号（用于主模式统计与分隔符启用判定，排除短词误切）。</summary>
+    [GeneratedRegex(
+        @"^(第[零〇○一二三四五六七八九十百千万萬0-9]|番[零〇○一二三四五六七八九十百千万0-9]|[0-9]{1,5}[．. ]|[零〇○一二三四五六七八九十百千万]{1,8}[、．.])",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex NumberedHeadingRegex();
+
+    private static bool TxtHeadingHasNumber(string title)
+        => NumberedHeadingRegex().IsMatch(title.TrimStart());
+
+    /// <summary>给已命中标题分桶：di(第X章)/fan(番X)/brk(括号)/cnpunct(中文+点)/ardot(阿+点)/arspace(阿+空格)/word(短词)。</summary>
+    private static string TxtHeadingPatternTag(string title)
+    {
+        var t = title.TrimStart();
+        if (t.StartsWith('第')) return "di";
+        if (t.StartsWith('番')) return "fan";
+        if (t.Length > 0 && "（([［〔〖".Contains(t[0])) return "brk";
+        if (ChineseNumPunctRegex().IsMatch(t)) return "cnpunct";
+        if (ArabicDotRegex().IsMatch(t)) return "ardot";
+        if (ArabicSpaceRegex().IsMatch(t)) return "arspace";
+        return "word";
+    }
+
+    /// <summary>未命中短行是否符合主模式形态（用于回填）。</summary>
+    private static bool TxtHeadingMatchesPattern(string line, string mainTag) => mainTag switch
+    {
+        "ardot" => ArabicDotRegex().IsMatch(line),
+        "arspace" => ArabicSpaceRegex().IsMatch(line),
+        "cnpunct" => ChineseNumPunctRegex().IsMatch(line),
+        "brk" => BracketNumberRegex().IsMatch(line),
+        "fan" => FanNumberRegex().IsMatch(line),
+        _ => false,
+    };
+
+    [GeneratedRegex(@"^[零〇○一二三四五六七八九十百千万]{1,8}[、．.]", RegexOptions.CultureInvariant)]
+    private static partial Regex ChineseNumPunctRegex();
+
+    [GeneratedRegex(@"^[0-9]{1,5}[．.](?![0-9０-９])", RegexOptions.CultureInvariant)]
+    private static partial Regex ArabicDotRegex();
+
+    [GeneratedRegex(@"^[0-9]{1,5}[ \t　]", RegexOptions.CultureInvariant)]
+    private static partial Regex ArabicSpaceRegex();
+
+    [GeneratedRegex(@"^[\(（\[［〔〖]\s*[零〇○一二三四五六七八九十百千万0-9]{1,8}\s*[\)）\]］〕〗]", RegexOptions.CultureInvariant)]
+    private static partial Regex BracketNumberRegex();
+
+    [GeneratedRegex(@"^番\s*[零〇○一二三四五六七八九十百千万0-9]{1,8}", RegexOptions.CultureInvariant)]
+    private static partial Regex FanNumberRegex();
+
+    /// <summary>按阅读器的段落规则计算章内进度范围：trim、忽略空行，每段长度加一。</summary>
+    private static int CalculateContentLength(ReadOnlySpan<char> content)
+    {
+        var total = 0;
+        while (true)
+        {
+            int newline = content.IndexOf('\n');
+            var line = (newline >= 0 ? content[..newline] : content).Trim();
+            if (!line.IsEmpty)
+            {
+                total = checked(total + line.Length + 1);
+            }
+
+            if (newline < 0) return total;
+            content = content[(newline + 1)..];
+        }
     }
 
     private void ExtractTextWithImages(HtmlNode node, StringBuilder sb, string currentDir)
@@ -778,26 +1040,66 @@ public partial class LocalBookService
         var bookUrl = $"local://{fileName}";
         var filePath = ResolveLocalPath(bookUrl);
         if (filePath == null) return (false, "非法文件名", "");
-        if (File.Exists(filePath) && !overwrite) return (false, "同名书籍已存在（可用 overwrite=true 覆盖）", "");
 
-        // 先写临时文件再原子替换，避免写一半的文件被当成书籍扫描出来。
-        var tmpPath = filePath + ".uploading";
+        var uploadLock = AcquireUploadLock(filePath);
+        await uploadLock.Gate.WaitAsync();
         try
         {
-            await using (var fs = File.Create(tmpPath))
+            // 在同名上传串行锁内检查，避免两个非覆盖请求同时通过检查。
+            if (File.Exists(filePath) && !overwrite)
+                return (false, "同名书籍已存在（可用 overwrite=true 覆盖）", "");
+
+            // 临时文件必须唯一且与目标同目录：既避免并发相互覆盖，又保证移动在同一文件系统内。
+            var tmpPath = $"{filePath}.{Guid.NewGuid():N}.uploading";
+            try
             {
-                await content.CopyToAsync(fs);
+                await using (var fs = File.Create(tmpPath))
+                {
+                    await content.CopyToAsync(fs);
+                }
+                File.Move(tmpPath, filePath, overwrite: true);
             }
-            File.Move(tmpPath, filePath, overwrite: true);
+            finally
+            {
+                if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            }
+
+            _epubCache.TryRemove(filePath, out _);
+            _txtCache.TryRemove(filePath, out _);
+            Console.WriteLine($"[UploadBook] saved: {fileName}");
+            return (true, "", bookUrl);
         }
         finally
         {
-            if (File.Exists(tmpPath)) File.Delete(tmpPath);
+            uploadLock.Gate.Release();
+            ReleaseUploadLock(filePath, uploadLock);
         }
+    }
 
-        _epubCache.TryRemove(filePath, out _);
-        _txtCache.TryRemove(filePath, out _);
-        Console.WriteLine($"[UploadBook] saved: {fileName}");
-        return (true, "", bookUrl);
+    private UploadLock AcquireUploadLock(string filePath)
+    {
+        lock (_uploadLocksLock)
+        {
+            if (!_uploadLocks.TryGetValue(filePath, out var uploadLock))
+            {
+                uploadLock = new UploadLock();
+                _uploadLocks.Add(filePath, uploadLock);
+            }
+            uploadLock.ReferenceCount++;
+            return uploadLock;
+        }
+    }
+
+    private void ReleaseUploadLock(string filePath, UploadLock uploadLock)
+    {
+        lock (_uploadLocksLock)
+        {
+            uploadLock.ReferenceCount--;
+            if (uploadLock.ReferenceCount == 0)
+            {
+                _uploadLocks.Remove(filePath);
+                uploadLock.Gate.Dispose();
+            }
+        }
     }
 }

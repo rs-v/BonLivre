@@ -58,7 +58,8 @@ public record BookChapter(
     string BaseUrl = "",
     string BookUrl = "",
     bool IsVip = false,
-    bool IsPay = false
+    bool IsPay = false,
+    int? ContentLength = null
 );
 
 public record BookContentSearchResult(

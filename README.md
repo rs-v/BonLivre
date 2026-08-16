@@ -151,7 +151,10 @@ How the credential is transmitted:
 ⚠️ **Security notes:**
 - Without HTTPS, the password is transmitted in plaintext. Use only on a trusted LAN, or put the backend behind HTTPS / an encrypted tunnel.
 - The query-parameter credential may appear in reverse-proxy or access logs.
-- There is no login rate limiting or lockout. This is intended for LAN/personal use, not public exposure.
+- With `BONLIVRE_PASSWORD` set, the shared-password middleware protects every API and WebSocket endpoint, including upload/delete operations and local cover/image resources. Static frontend files, `/`, `/health`, and CORS preflight requests remain public.
+- Failed password attempts are limited per direct client IP: by default, 10 failures in 5 minutes return `401`; later failures return `429 Too Many Requests` with `Retry-After`. Valid credentials are never rate-limited. Customize this with `BONLIVRE_AUTH_FAILURE_LIMIT`, `BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`, and `BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS`.
+- The client address is taken from the direct TCP connection. Forwarded-IP headers are intentionally not trusted by default.
+- Open mode remains available when `BONLIVRE_PASSWORD` is unset, so every API endpoint is public. This is intended for LAN/personal use, not public exposure.
 
 ### 🔌 API Endpoints
 
@@ -159,7 +162,7 @@ How the credential is transmitted:
 - `GET /getBookshelf` - Get all books in the bookshelf
 - `POST /saveBook` - Save a book to the bookshelf
 - `POST /deleteBook` - Move a local book to `books/.trash/`
-- `POST /uploadBook[?overwrite=true]` - Upload one or more local EPUB or TXT files
+- `POST /uploadBook[?overwrite=true]` - Upload up to 10 local EPUB or TXT files per request
 - `GET /getChapterList?url={url}` - Get chapter list for a book
 - `GET /getBookContent?url={url}&index={index}` - Get content of a specific chapter
 - `GET /searchBookContent?url={url}&key={key}` - Search content within a local book
