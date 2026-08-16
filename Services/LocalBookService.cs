@@ -277,7 +277,12 @@ public partial class LocalBookService
         var chapters = new List<BookChapter>(spans.Count);
         for (int i = 0; i < spans.Count; i++)
         {
-            chapters.Add(new BookChapter(spans[i].Title, $"{url}#{i}", i, spans[i].IsVolume));
+            chapters.Add(new BookChapter(
+                spans[i].Title,
+                $"{url}#{i}",
+                i,
+                IsVolume: spans[i].IsVolume,
+                ContentLength: spans[i].ContentLength));
         }
         return chapters;
     }
@@ -403,27 +408,24 @@ public partial class LocalBookService
         return $"{(start > 0 ? "…" : "")}{line[start..end]}{(end < line.Length ? "…" : "")}";
     }
 
-    /// <summary>TXT 章节切分结果：标题、在原文中的起始偏移与长度，以及是否为分卷标题。</summary>
-    private readonly record struct TxtChapterSpan(string Title, int Start, int Length, bool IsVolume);
+    /// <summary>TXT 章节切分结果：标题、原文区间、分卷标记，以及与阅读进度同口径的正文长度。</summary>
+    private readonly record struct TxtChapterSpan(
+        string Title,
+        int Start,
+        int Length,
+        bool IsVolume,
+        int ContentLength);
 
-    // 章节标题正则（逐行匹配）。覆盖三类：
-    //   1. 「第X章/节/回/卷/集/部/篇 …」X 为中文数字或阿拉伯数字；
-    //   2. 无编号的特殊卷目：序/序章/序言/楔子/前言/引子/后记/尾声/番外/外传/终章；
-    //   3. 英文 Chapter N。
-    // 限定整行仅由「标题 + 可选副标题」构成（长度受限），避免正文段落中以「第…章」开头的句子被误判为标题。
+    // 章节标题正则（逐行匹配）。只接受完整物理行，避免正文中提及章节时误切分。
+    // 支持常见中英文编号、卷目、特殊章节名、全角字符、标题包装和 CRLF。
     [GeneratedRegex(
-        @"^[ \t　]*(?<title>(?:第[零一二三四五六七八九十百千万两0-9]{1,9}[章节回卷集部篇](?:[ \t　].{0,30})?|(?:序章|序言|序|楔子|前言|引子|后记|尾声|番外|外传|终章)(?:[ \t　].{0,30})?|(?:Chapter|CHAPTER)[ \t]+[0-9]{1,4}(?:[ \t].{0,30})?))[ \t　]*$",
-        RegexOptions.Multiline)]
+        @"^[ \t　]*(?:【|\[)?[ \t　]*(?<title>(?:第[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}[ \t　]*(?:(?<volumeUnit>[卷部篇册])|[章节回集话幕])(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]]{0,80})?|(?<volumePrefix>[卷部篇册])[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]]{0,80})?|(?:完本感言|作品相关|大结局|Introduction|Prologue|Epilogue|Preface|Afterword|Appendix|序章|序言|序幕|楔子|前言|引子|导言|引言|正文|后记|后序|尾声|终章|结语|番外|外传|附录|跋)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]]{0,80})?|(?<englishVolume>Book|Part|Volume)[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]]{0,80})?|Chapter[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]]{0,80})?))[ \t　]*(?:】|\])?[ \t　]*(?=\r?$)",
+        RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex ChapterHeadingRegex();
 
-    // 分卷标题（卷/部/篇），前端可据 IsVolume 作层级展示；单独成章的「第X卷」等归为分卷。
-    [GeneratedRegex(@"[卷部篇]")]
-    private static partial Regex VolumeMarkerRegex();
-
     /// <summary>
-    /// 将 TXT 全文按章节标题切分为若干区间。目录与正文共用此方法，保证章节索引一致。
-    /// 规则：无标题命中时整篇作为单章「正文」；首个标题之前若存在非空内容，保留为「前言」章，
-    /// 避免序言/引子被丢弃。
+    /// 将 TXT 全文按章节标题切分为若干区间。目录、正文、搜索和全书进度共用这些区间。
+    /// 无标题命中时整篇作为单章「正文」；首个标题前的非空内容保留为「前言」。
     /// </summary>
     private static List<TxtChapterSpan> BuildTxtChapters(string content)
     {
@@ -432,15 +434,25 @@ public partial class LocalBookService
 
         if (matches.Count == 0)
         {
-            spans.Add(new TxtChapterSpan("正文", 0, content.Length, false));
+            spans.Add(new TxtChapterSpan(
+                "正文",
+                0,
+                content.Length,
+                false,
+                CalculateContentLength(content.AsSpan())));
             return spans;
         }
 
-        // 首个标题之前的正文（序言/前言等），非空则保留为一章
+        // 首个标题之前的正文（序言/前言等），非空则保留为一章。
         int firstStart = matches[0].Index;
         if (content.AsSpan(0, firstStart).Trim().Length > 0)
         {
-            spans.Add(new TxtChapterSpan("前言", 0, firstStart, false));
+            spans.Add(new TxtChapterSpan(
+                "前言",
+                0,
+                firstStart,
+                false,
+                CalculateContentLength(content.AsSpan(0, firstStart))));
         }
 
         for (int i = 0; i < matches.Count; i++)
@@ -448,11 +460,36 @@ public partial class LocalBookService
             int start = matches[i].Index;
             int end = (i + 1 < matches.Count) ? matches[i + 1].Index : content.Length;
             var title = matches[i].Groups["title"].Value.Trim();
-            bool isVolume = VolumeMarkerRegex().IsMatch(title);
-            spans.Add(new TxtChapterSpan(title, start, end - start, isVolume));
+            bool isVolume = matches[i].Groups["volumeUnit"].Success ||
+                matches[i].Groups["volumePrefix"].Success ||
+                matches[i].Groups["englishVolume"].Success;
+            spans.Add(new TxtChapterSpan(
+                title,
+                start,
+                end - start,
+                isVolume,
+                CalculateContentLength(content.AsSpan(start, end - start))));
         }
 
         return spans;
+    }
+
+    /// <summary>按阅读器的段落规则计算章内进度范围：trim、忽略空行，每段长度加一。</summary>
+    private static int CalculateContentLength(ReadOnlySpan<char> content)
+    {
+        var total = 0;
+        while (true)
+        {
+            int newline = content.IndexOf('\n');
+            var line = (newline >= 0 ? content[..newline] : content).Trim();
+            if (!line.IsEmpty)
+            {
+                total = checked(total + line.Length + 1);
+            }
+
+            if (newline < 0) return total;
+            content = content[(newline + 1)..];
+        }
     }
 
     private void ExtractTextWithImages(HtmlNode node, StringBuilder sb, string currentDir)

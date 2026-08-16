@@ -35,6 +35,8 @@ export type BookChapter = {
   url: string
   index: number
   isVolume: boolean
+  /** 与 chapterPos 同口径的 UTF-16 正文长度；不是文件字节数。 */
+  contentLength?: number | null
 }
 
 export type BookContentSearchResult = {
