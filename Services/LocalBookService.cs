@@ -196,15 +196,28 @@ public partial class LocalBookService
             {
                 // TXT 从文件名提取书名/作者，支持常见命名：《书名》作者、书名 - 作者、书名 作者：xxx。
                 (name, author) = ParseTxtFileName(fileName);
-                try
+                // 超大 TXT：整本读入做启发式切分代价高。书架扫描只需总章数与末章标题，
+                // 延迟到首次打开目录时再解析（GetChapterList 触发 GetOrAddTxt）。
+                // 这里按文件大小保守判定，避免书架加载卡顿。
+                var fi = new FileInfo(file);
+                const long LargeTxtBytes = 16L * 1024 * 1024;
+                if (fi.Length > LargeTxtBytes)
                 {
-                    var spans = GetOrAddTxt(file).Spans;
-                    totalChapters = spans.Count;
-                    if (spans.Count > 0) latestChapter = spans[^1].Title;
+                    totalChapters = 0;
+                    latestChapter = "未更新";
                 }
-                catch (Exception ex)
+                else
                 {
-                    Console.WriteLine($"[GetLocalBooks] TXT parse error: {file}: {ex.Message}");
+                    try
+                    {
+                        var spans = GetOrAddTxt(file).Spans;
+                        totalChapters = spans.Count;
+                        if (spans.Count > 0) latestChapter = spans[^1].Title;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[GetLocalBooks] TXT parse error: {file}: {ex.Message}");
+                    }
                 }
             }
 
@@ -266,11 +279,115 @@ public partial class LocalBookService
 
     private static string GetEpubChapterTitle(EpubBook book, string filePath, int chapterNumber)
     {
-        var title = book.Navigation?
-            .FirstOrDefault(n => n.Link?.ContentFilePath == filePath)?
-            .Title;
-        return string.IsNullOrWhiteSpace(title) ? $"章节 {chapterNumber}" : title.Trim();
+        // 1. 优先用 nav 匹配 reading-order 文件路径，拿到真实章节标题。
+        //    nav 可能含嵌套；VersOne.Epub 把所有层级平铺到 Navigation，逐个比对 ContentFilePath。
+        //    仅匹配 ContentFilePath（不含 Anchor）并要求有非空 Title，避免 Anchor-only 链接误匹配。
+        if (book.Navigation != null)
+        {
+            foreach (var n in book.Navigation)
+            {
+                var link = n.Link?.ContentFilePath;
+                if (!string.IsNullOrEmpty(link) && link == filePath && !string.IsNullOrWhiteSpace(n.Title))
+                    return n.Title.Trim();
+            }
+        }
+
+        // 2. nav 缺失时，回退到正文里首个标题标签（h1~h6）的文本；
+        //    再不行取正文首个非空文本段（如 calibre 用 <p><span>章节名</span></p> 包裹标题）。
+        var textFile = book.ReadingOrder.FirstOrDefault(f => f.FilePath == filePath);
+        if (textFile != null)
+        {
+            var heading = FirstHeadingTitle(textFile.Content);
+            if (!string.IsNullOrWhiteSpace(heading)) return heading.Trim();
+
+            var firstLine = FirstNonEmptyTextLine(textFile.Content);
+            if (!string.IsNullOrWhiteSpace(firstLine)) return firstLine.Trim();
+        }
+
+        return $"章节 {chapterNumber}";
     }
+
+    /// <summary>从 HTML 片段里取首个 h1~h6 标题的纯文本；无则返回 null。</summary>
+    private static string? FirstHeadingTitle(string? html)
+    {
+        if (string.IsNullOrEmpty(html)) return null;
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+        for (int level = 1; level <= 6; level++)
+        {
+            var node = doc.DocumentNode.SelectSingleNode($"//h{level}");
+            if (node != null)
+            {
+                var t = node.InnerText;
+                if (!string.IsNullOrWhiteSpace(t)) return t;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>取正文首个非空文本段（trim 后），用于无标题标签时尽力给出章节名。
+    /// 跳过明显的封面/标题页占位词（Cover/封面/标题页），避免这些被误当章节名。
+    /// 跳过过长的串（>80 字，多为简介/版权页）。
+    /// 若整章无像章节标题的串，回退首个非套话短行。</summary>
+    private static string? FirstNonEmptyTextLine(string? html)
+    {
+        if (string.IsNullOrEmpty(html)) return null;
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+        var body = doc.DocumentNode.SelectSingleNode("//body") ?? doc.DocumentNode;
+        string? first = null;
+        string? Probe(string t)
+        {
+            if (t.Length == 0 || t.Length > 80) return null;
+            if (IsPlaceholderPageText(t)) return null;
+            if (IsBoilerplateLine(t)) return null;
+            return t;
+        }
+        foreach (var p in body.Descendants("p"))
+        {
+            var t = Probe(HtmlEntity.DeEntitize(p.InnerText).Trim());
+            if (t == null) continue;
+            first ??= t;
+            if (LooksLikeChapterTitle(t)) return t;
+        }
+        if (first == null)
+        {
+            foreach (var blk in body.Descendants().Where(n => n.Name is "div" or "blockquote" or "span"))
+            {
+                if (blk.HasChildNodes && blk.ChildNodes.Any(c => c.NodeType == HtmlNodeType.Text))
+                {
+                    var t = Probe(HtmlEntity.DeEntitize(blk.InnerText).Trim());
+                    if (t == null) continue;
+                    first ??= t;
+                    if (LooksLikeChapterTitle(t)) return t;
+                }
+            }
+        }
+        return first;
+    }
+
+    private static bool IsPlaceholderPageText(string t)
+    {
+        var lower = t.ToLowerInvariant();
+        return lower is "cover" or "封面" or "标题页" or "title page" or "image"
+            || lower.StartsWith("cover", StringComparison.Ordinal);
+    }
+
+    // 版权页/署名行：以「译」「著」结尾、含「出版集团」「丛书」「系列」等。
+    private static bool IsBoilerplateLine(string t)
+    {
+        if (t.EndsWith("著", StringComparison.Ordinal) || t.EndsWith("译", StringComparison.Ordinal)) return true;
+        if (t.Contains("出版集团") || t.Contains("出版社")) return true;
+        if (t.Contains("丛书") || t.Contains("系列")) return true;
+        return false;
+    }
+
+    // 像章节标题：第N章/序章/楔子/前言/后记/番外，或纯短词（无标点、≤12 字）。
+    [GeneratedRegex(@"^(第[零〇○一二三四五六七八九十百千万萬0-9]+[章节回集话幕]|序章?|楔子|前言|后记|后序|尾声|终章|结语|番外|外传|附录|跋|简介|文案|内容提要|内容简介|作者的话|导读|Book|Part|Volume|Chapter)\b",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase)]
+    private static partial Regex ChapterLikeTitleRegex();
+    private static bool LooksLikeChapterTitle(string t) =>
+        ChapterLikeTitleRegex().IsMatch(t) || (t.Length <= 12 && !t.Contains('，') && !t.Contains('。'));
 
     public List<BookChapter>? GetChapterList(string url)
     {
@@ -503,18 +620,34 @@ public partial class LocalBookService
         }
     }
 
+    // 行内格式标签 -> 不破坏段落切分的占位标记。阅读器据此把段内片段包成 <em>/<strong>，
+    // 块级语义（blockquote/li）同理标记后还原。用成对 U+E000 区私有字符，不会出现在正文中，
+    // 也不在 JSON/HTML 需转义的范围内。
+    private const char InlineEmStart = '';
+    private const char InlineEmEnd = '';
+    private const char InlineStrongStart = '';
+    private const char InlineStrongEnd = '';
+    private const char BlockQuoteStart = '';
+    private const char BlockQuoteEnd = '';
+    private const char ListItemStart = '';
+    private const char ListItemEnd = '';
+
     private string ExtractEpubChapterText(string? htmlContent, string filePath)
     {
         if (string.IsNullOrEmpty(htmlContent)) return "";
         var doc = new HtmlDocument();
         doc.LoadHtml(htmlContent);
+        // 移除脚本/样式/head 元数据，避免正文混入无关内容。
         doc.DocumentNode.Descendants("script").ToList().ForEach(node => node.Remove());
         doc.DocumentNode.Descendants("style").ToList().ForEach(node => node.Remove());
+        doc.DocumentNode.Descendants("head").ToList().ForEach(node => node.Remove());
 
         var currentDir = (Path.GetDirectoryName(filePath) ?? "").Replace("\\", "/");
         var sb = new StringBuilder();
         ExtractTextWithImages(doc.DocumentNode, sb, currentDir);
-        return HtmlEntity.DeEntitize(sb.ToString());
+        var text = sb.ToString();
+        // 占位标记里的 &lt; 等 HTML 实体一并解码；标记字符本身不在 DeEntitize 处理范围。
+        return HtmlEntity.DeEntitize(text);
     }
 
     private static void AddChapterMatches(
@@ -527,17 +660,24 @@ public partial class LocalBookService
             var line = rawLine.Trim();
             if (line.Length == 0) continue;
 
-            position += line.Length + 1;
-            if (IsImageMarker(line)) continue;
+            // 进度口径：按含标记原文计可见字数（与阅读器 visibleLength 一致）。
+            position += CountVisibleChars(line) + 1;
+            if (IsMarkerLine(line)) continue;
+
+            // 搜索匹配与快照都在剥离私有标记后的纯文本上进行，
+            // 避免标记字符打断关键字、或偏移与可见文本不一致。
+            var plain = StripInlineMarkers(line);
+            if (plain.Length == 0) continue;
 
             var start = 0;
             while (results.Count < maxResults)
             {
-                var matchIndex = line.IndexOf(key, start, StringComparison.OrdinalIgnoreCase);
+                var matchIndex = plain.IndexOf(key, start, StringComparison.OrdinalIgnoreCase);
                 if (matchIndex < 0) break;
 
                 results.Add(new BookContentSearchResult(
-                    chapterIndex, chapterTitle, position, CreateSnippet(line, matchIndex, key.Length)));
+                    chapterIndex, chapterTitle, position,
+                    CreateSnippet(plain, matchIndex, key.Length)));
                 start = matchIndex + Math.Max(key.Length, 1);
             }
             if (results.Count >= maxResults) return;
@@ -552,8 +692,33 @@ public partial class LocalBookService
         const int contextLength = 36;
         var start = Math.Max(0, matchIndex - contextLength);
         var end = Math.Min(line.Length, matchIndex + matchLength + contextLength);
-        return $"{(start > 0 ? "…" : "")}{line[start..end]}{(end < line.Length ? "…" : "")}";
+        // 入参通常已是纯文本；仍做一次剥离，防止调用方传入带标记串。
+        var snippet = StripInlineMarkers(line[start..end]);
+        return $"{(start > 0 ? "…" : "")}{snippet}{(end < line.Length ? "…" : "")}";
     }
+
+    /// <summary>剥离私有占位标记（内联强调 + 块级语义），供搜索快照等只读纯文本场景使用。</summary>
+    private static readonly char[] PrivateMarkers =
+    [
+        InlineEmStart, InlineEmEnd, InlineStrongStart, InlineStrongEnd,
+        BlockQuoteStart, BlockQuoteEnd, ListItemStart, ListItemEnd,
+    ];
+
+    private static string StripInlineMarkers(string s)
+    {
+        if (s.IndexOfAny(PrivateMarkers) < 0) return s;
+        var sb = new StringBuilder(s.Length);
+        foreach (var ch in s)
+        {
+            if (IsPrivateMarker(ch)) continue;
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsPrivateMarker(char ch) =>
+        ch is InlineEmStart or InlineEmEnd or InlineStrongStart or InlineStrongEnd
+            or BlockQuoteStart or BlockQuoteEnd or ListItemStart or ListItemEnd;
 
     /// <summary>
     /// TXT 章节切分结果：标题、原文区间（字节偏移与字节长度，已含 BOM 调整）、分卷标记，
@@ -891,15 +1056,39 @@ public partial class LocalBookService
         {
             int newline = content.IndexOf('\n');
             var line = (newline >= 0 ? content[..newline] : content).Trim();
-            if (!line.IsEmpty)
+            // 忽略内联强调占位标记与图片/分隔线标记，统计纯文本字数。
+            if (!line.IsEmpty && !IsMarkerLine(line))
             {
-                total = checked(total + line.Length + 1);
+                total = checked(total + CountVisibleChars(line) + 1);
             }
 
             if (newline < 0) return total;
             content = content[(newline + 1)..];
         }
     }
+
+    /// <summary>是否为阅读器专用的非文本标记行（图片占位、水平分隔线）。</summary>
+    private static bool IsMarkerLine(ReadOnlySpan<char> line) =>
+        IsImageMarker(line.ToString()) || line.SequenceEqual("<hr>");
+
+    /// <summary>统计阅读器可见的字符数：剔除私有占位标记（内联强调 + 块级语义）。</summary>
+    private static int CountVisibleChars(ReadOnlySpan<char> line)
+    {
+        var count = 0;
+        foreach (var ch in line)
+        {
+            if (IsPrivateMarker(ch)) continue;
+            count++;
+        }
+        return count;
+    }
+
+    // 块级元素：遇到这些标签前后插入换行，保证段落切分正确。
+    private static readonly HashSet<string> BlockElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "p", "div", "br", "section", "article", "blockquote", "li", "ul", "ol",
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "tr", "figcaption",
+    };
 
     private void ExtractTextWithImages(HtmlNode node, StringBuilder sb, string currentDir)
     {
@@ -926,7 +1115,34 @@ public partial class LocalBookService
             return;
         }
 
-        if (node.Name == "br" || node.Name == "p" || node.Name == "div")
+        if (node.Name == "hr")
+        {
+            // 水平分隔线：作为独立段落输出，阅读器按分隔线样式渲染。
+            sb.Append("\n<hr>\n");
+            return;
+        }
+
+        // 块级语义包装：blockquote/li 渲染为带语义标记的段落，阅读器据此加引用/列表样式。
+        // 用与内联强调同源的私有标记（成对字符），不污染纯文本进度口径（CountVisibleChars 剔除）。
+        var blockSemantics = node.Name switch
+        {
+            "blockquote" => (Open: BlockQuoteStart, Close: BlockQuoteEnd),
+            "li" => (Open: ListItemStart, Close: ListItemEnd),
+            _ => (Open: '\0', Close: '\0'),
+        };
+        if (blockSemantics.Open != '\0') sb.Append(blockSemantics.Open);
+
+        // 行内强调：用私有占位标记包裹子树文本，阅读器据此还原 <em>/<strong>。
+        // 不直接输出 HTML 标签——避免污染纯文本段落与搜索快照。
+        var inlineTag = node.Name switch
+        {
+            "em" or "i" => (Open: InlineEmStart, Close: InlineEmEnd),
+            "strong" or "b" => (Open: InlineStrongStart, Close: InlineStrongEnd),
+            _ => (Open: '\0', Close: '\0'),
+        };
+        if (inlineTag.Open != '\0') sb.Append(inlineTag.Open);
+
+        if (BlockElements.Contains(node.Name))
         {
             sb.Append('\n');
         }
@@ -943,10 +1159,13 @@ public partial class LocalBookService
             sb.Append(node.InnerText);
         }
 
-        if (node.Name == "p" || node.Name == "div")
+        if (BlockElements.Contains(node.Name))
         {
             sb.Append('\n');
         }
+
+        if (inlineTag.Close != '\0') sb.Append(inlineTag.Close);
+        if (blockSemantics.Close != '\0') sb.Append(blockSemantics.Close);
     }
 
     public (byte[] Content, string MimeType)? GetEpubResource(string bookUrl, string resourcePath)

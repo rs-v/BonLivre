@@ -23,7 +23,16 @@
     NIGHT_THEME_INDEX,
   } from '../lib/themes'
 
-  type Paragraph = { text: string; img?: string; endPos: number }
+  type Paragraph = {
+    text: string
+    img?: string
+    hr?: boolean
+    quote?: boolean
+    listItem?: boolean
+    parts?: InlinePart[]
+    endPos: number
+  }
+  type InlinePart = { text: string; em?: boolean; strong?: boolean }
   type LoadedChapter = { index: number; title: string; paragraphs: Paragraph[] }
   type DrawerTab = 'catalog' | 'bookmarks'
   type SeekSegment = { chapterIndex: number; start: number; end: number }
@@ -58,6 +67,9 @@
   let contentSearchSheetEl = $state<HTMLElement | null>(null)
   let contentSearchButtonEl = $state<HTMLElement | null>(null)
   let contentSearchInputEl = $state<HTMLInputElement | null>(null)
+  let catalogFilterEl = $state<HTMLInputElement | null>(null)
+  let catalogFilter = $state('')
+  let volumesCollapsed = $state<Record<number, boolean>>({})
 
   const theme = $derived(themeAt(reading.config.theme))
   const fontFamily = $derived(
@@ -119,26 +131,139 @@
   const displayedProgressPercent = $derived(
     seekMap ? ((displayedBookPosition + 1) / seekMap.total) * 100 : 0,
   )
+  const chapterProgressPercent = $derived.by(() => {
+    if (!seekMap) return 0
+    const chapterIndex = Math.max(
+      0,
+      Math.min(reading.chapterIndex, reading.catalog.length - 1),
+    )
+    const chapterLength = reading.catalog[chapterIndex]?.contentLength ?? 0
+    if (chapterLength <= 0) return 0
+    return Math.min(
+      100,
+      Math.max(0, (reading.chapterPos / chapterLength) * 100),
+    )
+  })
   const displayedProgressTitle = $derived(
     displayedSeekTarget
       ? (reading.catalog[displayedSeekTarget.chapterIndex]?.title ?? '')
       : '',
   )
 
-  // 段落切分。图片行（后端 ExtractTextWithImages 生成的 <img src="...">）转为图片段。
-  // 进度按累计字数计，+1 计换行。
+  // 段落切分。图片行（后端 ExtractTextWithImages 生成的 <img src="...">）转为图片段；
+  // <hr> 转为分隔线段。私有占位标记（与后端 LocalBookService 约定一致）还原
+  // <em>/<strong> 与 blockquote/li 语义。进度按累计可见字数计，+1 计换行。
   const IMG_RE = /^<img src="([^"]+)">$/
+  // U+E000..U+E007 —— 与 Services/LocalBookService.cs 中的私有标记常量一一对应。
+  const EM_START = ''
+  const EM_END = ''
+  const STRONG_START = ''
+  const STRONG_END = ''
+  const QUOTE_START = ''
+  const QUOTE_END = ''
+  const LIST_START = ''
+  const LIST_END = ''
+  const PRIVATE_MARKERS = new Set([
+    EM_START,
+    EM_END,
+    STRONG_START,
+    STRONG_END,
+    QUOTE_START,
+    QUOTE_END,
+    LIST_START,
+    LIST_END,
+  ])
+
+  const parseInline = (line: string): InlinePart[] => {
+    const parts: InlinePart[] = []
+    let buf = ''
+    let em = false
+    let strong = false
+    const flush = () => {
+      if (buf) {
+        parts.push({ text: buf, em: em || undefined, strong: strong || undefined })
+        buf = ''
+      }
+    }
+    for (const ch of line) {
+      if (ch === EM_START) {
+        flush()
+        em = true
+      } else if (ch === EM_END) {
+        flush()
+        em = false
+      } else if (ch === STRONG_START) {
+        flush()
+        strong = true
+      } else if (ch === STRONG_END) {
+        flush()
+        strong = false
+      } else if (PRIVATE_MARKERS.has(ch)) {
+        // 块级标记由 splitContent 状态机处理；若残留则跳过，避免污染正文。
+        continue
+      } else {
+        buf += ch
+      }
+    }
+    flush()
+    return parts.length > 0 ? parts : [{ text: line }]
+  }
+
+  const visibleLength = (line: string): number => {
+    let n = 0
+    for (const ch of line) {
+      if (PRIVATE_MARKERS.has(ch)) continue
+      n++
+    }
+    return n
+  }
+
   const splitContent = (raw: string): Paragraph[] => {
     let pos = -1
-    return raw
-      .split(/\n+/)
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-      .map(line => {
-        pos += line.length + 1
-        const img = IMG_RE.exec(line)?.[1]
-        return { text: line, img, endPos: pos }
-      })
+    // 块级开/闭标记可能独占一行；跨行保持语义直到遇到闭标记。
+    let inQuote = false
+    let inList = false
+    const out: Paragraph[] = []
+    for (const rawLine of raw.split(/\n+/)) {
+      let line = rawLine.trim()
+      if (!line) continue
+
+      // 先处理开/闭标记，再计可见字数（标记不计）。
+      if (line.includes(QUOTE_START)) {
+        inQuote = true
+        line = line.split(QUOTE_START).join('')
+      }
+      if (line.includes(LIST_START)) {
+        inList = true
+        line = line.split(LIST_START).join('')
+      }
+      const closeQuote = line.includes(QUOTE_END)
+      const closeList = line.includes(LIST_END)
+      if (closeQuote) line = line.split(QUOTE_END).join('')
+      if (closeList) line = line.split(LIST_END).join('')
+      line = line.trim()
+
+      pos += visibleLength(rawLine.trim()) + 1
+
+      const img = IMG_RE.exec(line)?.[1]
+      if (img) {
+        out.push({ text: line, img, endPos: pos })
+      } else if (line === '<hr>') {
+        out.push({ text: line, hr: true, endPos: pos })
+      } else if (line) {
+        out.push({
+          text: line,
+          quote: inQuote || undefined,
+          listItem: inList || undefined,
+          parts: parseInline(line),
+          endPos: pos,
+        })
+      }
+      // 闭标记作用在本行之后结束，本行内容仍带语义。
+      if (closeQuote) inQuote = false
+      if (closeList) inList = false
+    }
+    return out
   }
 
   const fetchChapter = async (index: number): Promise<LoadedChapter | null> => {
@@ -329,6 +454,91 @@
     contentSearchOpen = false
     toChapter(result.chapterIndex, result.chapterPos)
   }
+
+  /** HTML 转义，供 {@html} 搜索高亮使用，避免快照中的 <>& 注入。 */
+  const escapeHtml = (s: string): string =>
+    s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+
+  /** 高亮搜索快照里的命中关键字；先转义再包 <mark>。 */
+  const highlightKey = (text: string, key: string): string => {
+    const escaped = escapeHtml(text)
+    if (!key) return escaped
+    const safe = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return escaped.replace(
+      new RegExp(safe, 'gi'),
+      match => `<mark class="search-hit">${match}</mark>`,
+    )
+  }
+
+  // 目录项：按关键字过滤后展示。空关键字时返回全量，供卷折叠使用。
+  const visibleCatalog = $derived.by(() => {
+    const filter = catalogFilter.trim().toLocaleLowerCase()
+    if (!filter) return reading.catalog.map((c, i) => ({ chapter: c, index: i }))
+    return reading.catalog
+      .map((c, i) => ({ chapter: c, index: i }))
+      .filter(item => item.chapter.title.trim().toLocaleLowerCase().includes(filter))
+  })
+
+  // 卷分组：每个卷标题对应其后到下一卷前的章节区间，用于折叠/缩进展示。
+  const volumeGroups = $derived.by(() => {
+    const groups: {
+      volumeIndex: number
+      volume: BookChapter
+      children: { chapter: BookChapter; index: number }[]
+    }[] = []
+    let current: { volumeIndex: number; volume: BookChapter; children: { chapter: BookChapter; index: number }[] } | null = null
+    const filter = catalogFilter.trim().toLocaleLowerCase()
+    reading.catalog.forEach((chapter, index) => {
+      if (chapter.isVolume) {
+        current = { volumeIndex: index, volume: chapter, children: [] }
+        groups.push(current)
+      } else if (current) {
+        // 关键字过滤下：未命中的子章不入组；空卷稍后剔除。
+        if (!filter || chapter.title.trim().toLocaleLowerCase().includes(filter)) {
+          current.children.push({ chapter, index })
+        }
+      } else {
+        // 卷前的散章：当作无卷子章，单独成组。
+        if (!filter || chapter.title.trim().toLocaleLowerCase().includes(filter)) {
+          groups.push({
+            volumeIndex: index,
+            volume: chapter,
+            children: [],
+          })
+        }
+      }
+    })
+    // 过滤模式下丢掉「卷标题本身不命中且无子章」的空卷，避免目录刷屏。
+    if (filter) {
+      return groups.filter(
+        g =>
+          g.children.length > 0 ||
+          g.volume.title.trim().toLocaleLowerCase().includes(filter),
+      )
+    }
+    return groups
+  })
+
+  const toggleVolume = (index: number) => {
+    volumesCollapsed = { ...volumesCollapsed, [index]: !volumesCollapsed[index] }
+  }
+
+  // 当前章是否落在某卷的子章区间内（用于自动展开含当前章的卷）。
+  const chapterVolumeIndex = $derived.by(() => {
+    let vol = -1
+    for (let i = 0; i <= reading.chapterIndex && i < reading.catalog.length; i++) {
+      if (reading.catalog[i].isVolume) vol = i
+    }
+    return vol
+  })
+
+  // 章节是否可见：卷折叠时隐藏子章；当前章所在卷始终展开。
+  const isChapterVisible = (volumeIndex: number) =>
+    volumesCollapsed[volumeIndex] !== true || volumeIndex === chapterVolumeIndex
 
   const toChapter = async (index: number, pos = 0): Promise<boolean> => {
     if (index < 0) {
@@ -674,6 +884,24 @@
           </button>
         </div>
         {#if drawerTab === 'catalog'}
+          <div class="catalog-filter-row">
+            <input
+              class="catalog-filter"
+              bind:this={catalogFilterEl}
+              bind:value={catalogFilter}
+              placeholder="过滤章节标题"
+              aria-label="过滤章节标题"
+              onclick={e => e.stopPropagation()}
+              onkeydown={e => e.stopPropagation()}
+            />
+            {#if catalogFilter}
+              <button
+                class="btn-icon catalog-filter-clear"
+                aria-label="清除过滤"
+                onclick={e => { e.stopPropagation(); catalogFilter = '' }}
+              >×</button>
+            {/if}
+          </div>
           <div
             id="drawer-panel-catalog"
             class="drawer-panel catalog-list"
@@ -681,16 +909,51 @@
             aria-labelledby="drawer-tab-catalog"
             bind:this={catalogListEl}
           >
-            {#each reading.catalog as chapter, i (chapter.url)}
-              <button
-                class="catalog-item body-medium"
-                class:active={i === reading.chapterIndex}
-                class:volume={chapter.isVolume}
-                onclick={() => toChapter(i)}
-              >
-                {chapter.title}
-              </button>
-            {/each}
+            {#if volumeGroups.length > 0 && !catalogFilter.trim()}
+              {#each volumeGroups as group (group.volumeIndex)}
+                {#if group.children.length > 0}
+                  <button
+                    class="catalog-item body-medium volume-row"
+                    class:active={group.volumeIndex === reading.chapterIndex}
+                    aria-expanded={isChapterVisible(group.volumeIndex)}
+                    onclick={() => toggleVolume(group.volumeIndex)}
+                  >
+                    <span class="catalog-caret">{isChapterVisible(group.volumeIndex) ? '▾' : '▸'}</span>
+                    <span class="catalog-title">{group.volume.title}</span>
+                  </button>
+                  {#if isChapterVisible(group.volumeIndex)}
+                    {#each group.children as child (child.index)}
+                      <button
+                        class="catalog-item body-medium child-chapter"
+                        class:active={child.index === reading.chapterIndex}
+                        onclick={() => toChapter(child.index)}
+                      >
+                        {child.chapter.title}
+                      </button>
+                    {/each}
+                  {/if}
+                {:else}
+                  <button
+                    class="catalog-item body-medium"
+                    class:active={group.volumeIndex === reading.chapterIndex}
+                    onclick={() => toChapter(group.volumeIndex)}
+                  >
+                    {group.volume.title}
+                  </button>
+                {/if}
+              {/each}
+            {:else}
+              {#each visibleCatalog as item (item.chapter.url)}
+                <button
+                  class="catalog-item body-medium"
+                  class:active={item.index === reading.chapterIndex}
+                  class:volume={item.chapter.isVolume}
+                  onclick={() => toChapter(item.index)}
+                >
+                  {item.chapter.title}
+                </button>
+              {/each}
+            {/if}
           </div>
         {:else}
           <div
@@ -763,13 +1026,35 @@
                   loading="lazy"
                 />
               </p>
+            {:else if p.hr}
+              <hr
+                data-chapter={chapter.index}
+                data-pos={p.endPos}
+                class="content-hr"
+              />
             {:else}
               <p
                 data-chapter={chapter.index}
                 data-pos={p.endPos}
+                class:content-quote={p.quote}
+                class:content-li={p.listItem}
                 style:margin="{reading.config.spacing.paragraph}em 0"
               >
-                {p.text}
+                {#if p.parts && p.parts.some(part => part.em || part.strong)}
+                  {#each p.parts as part, i (`${p.endPos}-${i}`)}
+                    {#if part.strong && part.em}
+                      <strong><em>{part.text}</em></strong>
+                    {:else if part.strong}
+                      <strong>{part.text}</strong>
+                    {:else if part.em}
+                      <em>{part.text}</em>
+                    {:else}
+                      {part.text}
+                    {/if}
+                  {/each}
+                {:else}
+                  {p.text}
+                {/if}
               </p>
             {/if}
           {/each}
@@ -814,6 +1099,12 @@
           </span>
         </div>
       {/if}
+      <div class="chapter-progress" aria-hidden="true">
+        <div
+          class="chapter-progress-bar"
+          style:width="{chapterProgressPercent}%"
+        ></div>
+      </div>
       <div class="bottom-app-bar">
       <button class="bar-item" onclick={backToShelf} aria-label="返回书架">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
@@ -966,7 +1257,9 @@
           {#each contentSearchResults as result, i (`${result.chapterIndex}-${result.chapterPos}-${i}`)}
             <button class="content-search-result" onclick={() => jumpToSearchResult(result)}>
               <span class="content-search-result-title label-medium">{result.chapterTitle}</span>
-              <span class="content-search-result-snippet body-medium">{result.snippet}</span>
+              <span class="content-search-result-snippet body-medium">
+                {@html highlightKey(result.snippet, contentSearchKey.trim())}
+              </span>
             </button>
           {/each}
         </div>
@@ -1150,6 +1443,41 @@
     border-radius: var(--md-shape-sm);
   }
 
+  .content-hr {
+    border: none;
+    border-top: 1px solid var(--md-outline-variant);
+    margin: 1.4em 0;
+    opacity: 0.6;
+  }
+
+  .content em,
+  .content strong {
+    text-indent: 0;
+  }
+
+  /* blockquote：左侧强调条 + 略缩进，与正文区分。 */
+  .content-quote {
+    border-left: 3px solid var(--md-outline-variant);
+    padding-left: 0.9em;
+    margin-left: 0.2em;
+    color: var(--md-on-surface-variant);
+    text-indent: 0 !important;
+  }
+
+  /* 列表项：圆点前缀，取消首行缩进。 */
+  .content-li {
+    text-indent: 0 !important;
+    padding-left: 1.2em;
+    position: relative;
+  }
+
+  .content-li::before {
+    content: '•';
+    position: absolute;
+    left: 0.25em;
+    color: var(--md-on-surface-variant);
+  }
+
   .loading {
     opacity: 0.6;
   }
@@ -1224,6 +1552,21 @@
     outline-offset: 2px;
   }
 
+  /* 章内进度细条：贴在工具栏上沿，随当前段落累计字数填充。 */
+  .chapter-progress {
+    height: 2px;
+    width: 100%;
+    background: var(--md-outline-variant);
+    overflow: hidden;
+    opacity: 0.85;
+  }
+
+  .chapter-progress-bar {
+    height: 100%;
+    background: var(--md-primary);
+    transition: width 0.2s ease-out;
+  }
+
   .bottom-app-bar {
     height: var(--reader-action-bar-height);
     display: flex;
@@ -1293,6 +1636,57 @@
     gap: 4px;
     padding: 0 12px 8px;
     border-bottom: 1px solid var(--md-outline-variant);
+  }
+
+  /* 目录过滤框 + 卷折叠 */
+  .catalog-filter-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--md-outline-variant);
+  }
+
+  .catalog-filter {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+
+  .catalog-filter-clear {
+    width: 32px;
+    height: 32px;
+    font-size: 18px;
+    color: var(--md-on-surface-variant);
+  }
+
+  .catalog-caret {
+    display: inline-block;
+    width: 16px;
+    text-align: center;
+    color: var(--md-on-surface-variant);
+    flex-shrink: 0;
+  }
+
+  .catalog-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .child-chapter {
+    padding-left: 36px;
+  }
+
+  /* 搜索结果命中高亮 */
+  :global(.search-hit) {
+    background: color-mix(in srgb, var(--md-primary) 28%, transparent);
+    color: var(--md-on-surface);
+    border-radius: 2px;
+    padding: 0 1px;
   }
 
   .drawer-tab {

@@ -31,6 +31,50 @@
     localStorage.getItem(SHELF_SORT_KEY) === 'imported' ? 'imported' : 'recent',
   )
 
+  // 批量选择模式：进入后卡片显示勾选框，点击切换选中；FAB 切换为「删除选中」。
+  let selectionMode = $state(false)
+  let selectedUrls = $state<Set<string>>(new Set())
+
+  const enterSelection = () => {
+    selectionMode = true
+    selectedUrls = new Set()
+  }
+
+  const exitSelection = () => {
+    selectionMode = false
+    selectedUrls = new Set()
+  }
+
+  const toggleSelect = (bookUrl: string) => {
+    const next = new Set(selectedUrls)
+    if (next.has(bookUrl)) next.delete(bookUrl)
+    else next.add(bookUrl)
+    selectedUrls = next
+  }
+
+  const deleteSelected = async () => {
+    if (selectedUrls.size === 0) return
+    if (!confirm(`删除选中的 ${selectedUrls.size} 本书籍？文件将移入回收站。`)) return
+    uploading = true
+    try {
+      let failed = 0
+      for (const book of shelf.filter(b => selectedUrls.has(b.bookUrl))) {
+        try {
+          const resp = await api.deleteBook(book)
+          if (!resp.isSuccess) failed++
+        } catch {
+          failed++
+        }
+      }
+      await loadShelf()
+      exitSelection()
+      if (failed > 0) toast(`${failed} 本删除失败`, 'error')
+      else toast('已删除选中书籍', 'success')
+    } finally {
+      uploading = false
+    }
+  }
+
   const toggleShelfView = () => {
     shelfView = shelfView === 'list' ? 'grid' : 'list'
     localStorage.setItem(SHELF_VIEW_KEY, shelfView)
@@ -165,7 +209,13 @@
       if (files.length === 0) return
       uploading = true
       try {
-        let resp = await api.uploadBook(files)
+        // 导入前先列出已有书名，对重名给出明确提示而非「同名已存在」。
+        const existing = new Set(shelf.map(b => b.bookUrl))
+        const dupes = files.filter(f => existing.has(`local://${f.name}`))
+        if (dupes.length > 0 && !confirm(`已有同名书籍 ${dupes.length} 本，是否覆盖导入？`)) {
+          return
+        }
+        let resp = await api.uploadBook(files, dupes.length > 0)
         if (!resp.isSuccess) {
           if (!confirm(`${resp.errorMsg}\n是否覆盖导入？`)) return
           resp = await api.uploadBook(files, true)
@@ -310,14 +360,24 @@
           {#if shelfView === 'grid'}
             <BookGridCard
               {book}
-              onclick={() => openBook(book)}
-              ondelete={searching ? undefined : () => removeBook(book as Book)}
+              selected={selectionMode && selectedUrls.has(book.bookUrl)}
+              selecting={selectionMode}
+              onclick={() =>
+                selectionMode ? toggleSelect(book.bookUrl) : openBook(book)}
+              ondelete={searching || selectionMode
+                ? undefined
+                : () => removeBook(book as Book)}
             />
           {:else}
             <BookCard
               {book}
-              onclick={() => openBook(book)}
-              ondelete={searching ? undefined : () => removeBook(book as Book)}
+              selected={selectionMode && selectedUrls.has(book.bookUrl)}
+              selecting={selectionMode}
+              onclick={() =>
+                selectionMode ? toggleSelect(book.bookUrl) : openBook(book)}
+              ondelete={searching || selectionMode
+                ? undefined
+                : () => removeBook(book as Book)}
             />
           {/if}
         {/each}
@@ -325,22 +385,52 @@
     {/if}
   </main>
 
-  <!-- MD3 FAB：导入书籍 -->
+  {#if selectionMode}
+    <div class="selection-bar">
+      <button class="btn-text" onclick={exitSelection}>取消</button>
+      <span class="selection-count body-medium">
+        已选 {selectedUrls.size} 本
+      </span>
+      <button
+        class="btn-text delete-selected"
+        disabled={selectedUrls.size === 0 || uploading}
+        onclick={deleteSelected}
+      >删除</button>
+    </div>
+  {/if}
+
+  <!-- MD3 FAB：导入书籍 / 批量管理 -->
   <button
     class="fab"
-    title="导入书籍（.txt / .epub）"
-    aria-label="导入书籍"
+    title={selectionMode ? '批量管理' : '导入书籍（.txt / .epub）'}
+    aria-label={selectionMode ? '批量管理' : '导入书籍'}
     disabled={uploading}
-    onclick={pickAndUpload}
+    onclick={() => (selectionMode ? exitSelection() : pickAndUpload())}
   >
     {#if uploading}
       <span class="label-medium">导入中…</span>
+    {:else if selectionMode}
+      <span class="label-medium">完成</span>
     {:else}
       <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
         <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
       </svg>
     {/if}
   </button>
+
+  <!-- 非选择模式 + 非搜索时显示批量入口 -->
+  {#if !selectionMode && !searching && shelf.length > 0}
+    <button
+      class="fab fab-secondary"
+      title="批量管理"
+      aria-label="批量管理"
+      onclick={enterSelection}
+    >
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M3 5h2v2H3V5zm0 6h2v2H3v-2zm0 6h2v2H3v-2zM7 5h14v2H7V5zm0 6h14v2H7v-2zm0 6h14v2H7v-2z" />
+      </svg>
+    </button>
+  {/if}
 </div>
 
 <ConnectDialog bind:open={connectDialogOpen} onconnected={loadShelf} />
@@ -496,6 +586,41 @@
   .fab:hover {
     box-shadow: var(--md-elevation-3);
     opacity: 1;
+  }
+
+  /* 次级 FAB：批量管理入口，错开主 FAB */
+  .fab-secondary {
+    right: 24px;
+    bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    background: var(--md-secondary-container);
+    color: var(--md-on-secondary-container);
+    min-width: 48px;
+    height: 48px;
+    padding: 0 12px;
+  }
+
+  /* 选择模式底栏：取消 + 计数 + 删除 */
+  .selection-bar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0px));
+    background: var(--md-surface-container);
+    color: var(--md-on-surface);
+    box-shadow: var(--md-elevation-2);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    z-index: 40;
+  }
+
+  .selection-count {
+    color: var(--md-on-surface-variant);
+  }
+
+  .selection-bar .delete-selected {
+    color: var(--md-error);
   }
 
   @media (max-width: 750px) {

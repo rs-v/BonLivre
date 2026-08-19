@@ -6,10 +6,14 @@
     book,
     onclick,
     ondelete,
+    selected = false,
+    selecting = false,
   }: {
     book: Book | SearchBook
     onclick: () => void
     ondelete?: () => void
+    selected?: boolean
+    selecting?: boolean
   } = $props()
 
   const cover = $derived(
@@ -23,11 +27,23 @@
     const b = book as Book
     return b.durChapterTime > 0 ? `读至：${b.durChapterTitle}` : '未开始阅读'
   })
+
+  // 全书进度百分比：与 BookCard 同口径，用章级估算做概览。
+  const progressPercent = $derived.by(() => {
+    if (!('durChapterIndex' in book)) return null
+    const b = book as Book
+    // 超大 TXT 书架扫描时 totalChapterNum 可能为 0（延迟解析），此时不假装 100%。
+    if (!b.totalChapterNum || b.totalChapterNum <= 0) return null
+    // 章级概览：已抵达章（1-based）/ 总章数。读到第 1 章≈1/N，最后一章=100%。
+    const idx = Math.max(0, Math.min(b.durChapterIndex ?? 0, b.totalChapterNum - 1))
+    return Math.round(((idx + 1) / b.totalChapterNum) * 100)
+  })
 </script>
 
 <!-- 封面宫格卡片：竖向封面 + 书名/作者 -->
 <div
   class="card"
+  class:selected
   role="button"
   tabindex="0"
   {onclick}
@@ -35,6 +51,11 @@
 >
   <div class="cover-wrap">
     <img class="cover" src={cover} alt={book.name} loading="lazy" />
+    {#if selecting}
+      <span class="select-check" class:checked={selected} aria-hidden="true">
+        {selected ? '✓' : ''}
+      </span>
+    {/if}
     {#if progressText}
       <span class="progress label-small">{progressText}</span>
     {/if}
@@ -54,6 +75,13 @@
           />
         </svg>
       </button>
+    {/if}
+    {#if progressPercent !== null && progressPercent > 0}
+      <span
+        class="progress-pct label-small"
+        style="--p:{progressPercent}"
+        aria-hidden="true"
+      >{progressPercent}%</span>
     {/if}
   </div>
   <div class="name title-medium" title={book.name}>{book.name}</div>
@@ -84,6 +112,34 @@
     box-shadow: var(--md-elevation-2);
   }
 
+  .card.selected .cover-wrap {
+    outline: 2px solid var(--md-primary);
+    outline-offset: -2px;
+  }
+
+  .select-check {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 22px;
+    height: 22px;
+    border-radius: var(--md-shape-full);
+    border: 2px solid var(--md-outline);
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    z-index: 1;
+  }
+
+  .select-check.checked {
+    background: var(--md-primary);
+    border-color: var(--md-primary);
+  }
+
   .cover {
     width: 100%;
     height: 100%;
@@ -104,6 +160,24 @@
     overflow: hidden;
     text-overflow: ellipsis;
     font-size: 11px;
+  }
+
+  /* 右下角进度百分比徽标：与封面角标互补，仅在已有阅读进度时出现。 */
+  .progress-pct {
+    position: absolute;
+    right: 6px;
+    top: 6px;
+    min-width: 30px;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: var(--md-shape-full);
+    background: color-mix(in srgb, var(--md-primary) 80%, transparent);
+    color: var(--md-on-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
   }
 
   .name {
