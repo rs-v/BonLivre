@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using System.Text;
 using System.Linq;
@@ -12,10 +13,36 @@ public partial class LocalBookService
     private readonly string _booksDir;
     // 缓存以 (LastWriteTimeUtc, Length) 做失效判断：books/ 目录下的文件可能被用户替换，
     // 旧缓存若不失效会一直读到替换前的内容。
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime LastWriteUtc, EpubBook Book)> _epubCache = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, TxtBookCache> _txtCache = new();
+    // EpubBook 会把整本（含全部图片）读进内存，所以缓存必须有上限：超过 MaxCachedEpubs
+    // 就淘汰最久未访问的条目，否则书架上每多一本 EPUB 就永久多占几十 MB。
+    private const int MaxCachedEpubs = 8;
+    private static readonly ConcurrentDictionary<string, EpubCacheEntry> _epubCache = new();
+    private static readonly ConcurrentDictionary<string, TxtBookCache> _txtCache = new();
+    // 书架元数据缓存：只存书名/作者/简介/章数/末章名，一条几百字节，不随书数量吃内存。
+    // 有了它 GetLocalBooks 就不必为每本 EPUB 触碰 _epubCache，书架加载与 EPUB 缓存上限互不干扰。
+    private static readonly ConcurrentDictionary<string, ShelfMetaCache> _shelfMetaCache = new();
+    private static long _epubAccessCounter;
     private readonly Dictionary<string, UploadLock> _uploadLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _uploadLocksLock = new();
+
+    private sealed class EpubCacheEntry
+    {
+        public required DateTime LastWriteUtc { get; init; }
+        public required long Length { get; init; }
+        public required EpubBook Book { get; init; }
+        /// <summary>单调递增的访问序号，仅用于挑选淘汰对象。</summary>
+        public long LastAccess;
+    }
+
+    /// <summary>书架条目的元数据快照，按 (LastWriteTimeUtc, Length) 失效。</summary>
+    private sealed record ShelfMetaCache(
+        DateTime LastWriteUtc,
+        long Length,
+        string Name,
+        string Author,
+        string? Intro,
+        int TotalChapters,
+        string LatestChapter);
 
     private sealed class UploadLock
     {
@@ -31,14 +58,40 @@ public partial class LocalBookService
 
     private EpubBook GetOrAddEpub(string filePath)
     {
-        var lastWrite = File.GetLastWriteTimeUtc(filePath);
-        if (_epubCache.TryGetValue(filePath, out var cached) && cached.LastWriteUtc == lastWrite)
+        var info = new FileInfo(filePath);
+        if (_epubCache.TryGetValue(filePath, out var cached) &&
+            cached.LastWriteUtc == info.LastWriteTimeUtc && cached.Length == info.Length)
         {
+            cached.LastAccess = Interlocked.Increment(ref _epubAccessCounter);
             return cached.Book;
         }
         var book = EpubReader.ReadBook(filePath);
-        _epubCache[filePath] = (lastWrite, book);
+        _epubCache[filePath] = new EpubCacheEntry
+        {
+            LastWriteUtc = info.LastWriteTimeUtc,
+            Length = info.Length,
+            Book = book,
+            LastAccess = Interlocked.Increment(ref _epubAccessCounter),
+        };
+        TrimEpubCache();
         return book;
+    }
+
+    /// <summary>缓存超限时淘汰最久未访问的条目。并发下允许短暂略微超限，不值得为此加全局锁。</summary>
+    private static void TrimEpubCache()
+    {
+        while (_epubCache.Count > MaxCachedEpubs)
+        {
+            string? oldestKey = null;
+            var oldestAccess = long.MaxValue;
+            foreach (var (key, entry) in _epubCache)
+            {
+                if (entry.LastAccess >= oldestAccess) continue;
+                oldestAccess = entry.LastAccess;
+                oldestKey = key;
+            }
+            if (oldestKey == null || !_epubCache.TryRemove(oldestKey, out _)) break;
+        }
     }
 
     /// <summary>
@@ -60,10 +113,11 @@ public partial class LocalBookService
         {
             return cached;
         }
-        var (encoding, bomLength, content) = ReadTextAutoEncoding(filePath);
+        var bytes = File.ReadAllBytes(filePath);
+        var (encoding, bomLength, content) = DecodeTextAutoEncoding(bytes);
         // 切分在解码后的整本 string 上做（启发式需全文扫描，无法不读），
         // 但完成后不再保留整本 string——只把 char 索引翻译成字节偏移存进 Span。
-        var spans = BuildTxtChaptersWithByteOffsets(content, encoding, bomLength);
+        var spans = BuildTxtChaptersWithByteOffsets(content, bytes, encoding, bomLength);
         var entry = new TxtBookCache(info.LastWriteTimeUtc, info.Length, encoding, bomLength, spans);
         _txtCache[filePath] = entry;
         return entry;
@@ -96,20 +150,21 @@ public partial class LocalBookService
     };
 
     /// <summary>
-    /// 读取文本文件并自动识别编码：先看 BOM（UTF-8/UTF-16LE/BE），无 BOM 时尝试严格 UTF-8
+    /// 识别文本编码并解码：先看 BOM（UTF-8/UTF-16LE/BE），无 BOM 时尝试严格 UTF-8
     /// 解码，失败则按 GB18030（兼容 GBK/GB2312，中文 TXT 最常见的非 UTF-8 编码）解码。
     /// 都不行时回退宽松 UTF-8，乱码总好过 500。
-    /// 返回 (解码用 Encoding, BOM 长度, 解码后的整本 string)。BOM 长度用于后续按字节范围 seek 时跳过头部。
+    /// 返回 (解码用 Encoding, BOM 长度, 解码后的整本 string)。
+    /// 返回的 Encoding 只用于标识编码种类；实际解码一律走 <see cref="ForReading"/> 的宽松副本，
+    /// 保证「探测/切分/读章」三处对同一批字节得到完全一致的字符流。
     /// </summary>
-    private static (Encoding Encoding, int BomLength, string Content) ReadTextAutoEncoding(string filePath)
+    private static (Encoding Encoding, int BomLength, string Content) DecodeTextAutoEncoding(byte[] bytes)
     {
-        var bytes = File.ReadAllBytes(filePath);
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-            return (StrictUtf8, 3, Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3));
+            return (StrictUtf8, 3, Decode(StrictUtf8, bytes, 3));
         if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
-            return (Encoding.Unicode, 2, Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2));
+            return (Encoding.Unicode, 2, Decode(Encoding.Unicode, bytes, 2));
         if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
-            return (Encoding.BigEndianUnicode, 2, Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2));
+            return (Encoding.BigEndianUnicode, 2, Decode(Encoding.BigEndianUnicode, bytes, 2));
 
         try
         {
@@ -123,8 +178,60 @@ public partial class LocalBookService
                 try { return (gb, 0, gb.GetString(bytes)); }
                 catch (DecoderFallbackException) { }
             }
-            return (Encoding.UTF8, 0, Encoding.UTF8.GetString(bytes));
+            return (Encoding.UTF8, 0, Decode(Encoding.UTF8, bytes, 0));
         }
+
+        static string Decode(Encoding encoding, byte[] bytes, int bomLength) =>
+            ForReading(encoding).GetString(bytes, bomLength, bytes.Length - bomLength);
+    }
+
+    /// <summary>
+    /// 把一组升序的 char 索引翻译成文件内的绝对字节偏移（含 BOM）。
+    ///
+    /// 不能靠「把解码后的字符串重新编码」来算：宽松回退下非法字节被替换成 U+FFFD，
+    /// 再编码回去字节数不同（例如 1 字节的坏字节变成 3 字节），偏移会从损坏点起整体漂移，
+    /// 之后每一章都会 seek 到错误位置、章首被截断或乱码。
+    ///
+    /// 这里改为重放一次解码：用与解码时完全相同的 Decoder，把输出缓冲的容量限制成
+    /// 「到下一个目标 char 为止」，Convert 填满输出缓冲就会停下，此时报告的 bytesUsed
+    /// 正是这段 char 精确对应的字节数。逐目标推进即可得到精确映射。
+    /// </summary>
+    private static long[] MapCharIndicesToByteOffsets(
+        byte[] bytes, int bomLength, Encoding encoding, List<int> charIndices)
+    {
+        var offsets = new long[charIndices.Count];
+        var decoder = ForReading(encoding).GetDecoder();
+        const int MaxChunkChars = 8192;
+        var scratch = new char[MaxChunkChars];
+        var bytePos = Math.Min(bomLength, bytes.Length);
+        var charPos = 0;
+
+        for (var i = 0; i < charIndices.Count; i++)
+        {
+            // charIndices 升序；用 Max 兜住「上一轮为跨过代理对而多解了一个 char」的情况。
+            var target = Math.Max(charPos, charIndices[i]);
+            while (charPos < target && bytePos < bytes.Length)
+            {
+                var want = Math.Min(MaxChunkChars, target - charPos);
+                decoder.Convert(bytes, bytePos, bytes.Length - bytePos,
+                    scratch, 0, want, flush: false,
+                    out var bytesUsed, out var charsUsed, out _);
+                if (bytesUsed == 0 && charsUsed == 0)
+                {
+                    // 目标恰好落在一个代理对中间：Convert 不肯拆开代理对，放宽一格让它整对写出，
+                    // 越过边界后继续（此时 charPos 会比 target 多 1，由上面的 Max 吸收）。
+                    if (want >= MaxChunkChars) break;
+                    decoder.Convert(bytes, bytePos, bytes.Length - bytePos,
+                        scratch, 0, want + 1, flush: false,
+                        out bytesUsed, out charsUsed, out _);
+                    if (bytesUsed == 0 && charsUsed == 0) break;
+                }
+                bytePos += bytesUsed;
+                charPos += charsUsed;
+            }
+            offsets[i] = bytePos;
+        }
+        return offsets;
     }
 
     /// <summary>
@@ -161,81 +268,96 @@ public partial class LocalBookService
 
         foreach (var file in localFiles)
         {
-            var fileName = Path.GetFileNameWithoutExtension(file);
             var isEpub = file.EndsWith(".epub", StringComparison.OrdinalIgnoreCase);
-
-            string name = fileName;
-            string author = isEpub ? "EPUB" : "本地作者";
-            string? intro = "";
-            int totalChapters = 0;
-            string latestChapter = "未更新";
-
-            if (isEpub)
-            {
-                // 优先用 EPUB 元数据里的书名/作者/简介；解析失败回退文件名。
-                try
-                {
-                    var epub = GetOrAddEpub(file);
-                    if (!string.IsNullOrWhiteSpace(epub.Title)) name = epub.Title.Trim();
-                    var epubAuthor = epub.Author;
-                    if (!string.IsNullOrWhiteSpace(epubAuthor)) author = epubAuthor.Trim();
-                    intro = epub.Description;
-                    totalChapters = epub.ReadingOrder.Count;
-                    if (totalChapters > 0)
-                    {
-                        var lastFile = epub.ReadingOrder[totalChapters - 1];
-                        latestChapter = GetEpubChapterTitle(epub, lastFile.FilePath, totalChapters);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[GetLocalBooks] EPUB metadata error: {file}: {ex.Message}");
-                }
-            }
-            else
-            {
-                // TXT 从文件名提取书名/作者，支持常见命名：《书名》作者、书名 - 作者、书名 作者：xxx。
-                (name, author) = ParseTxtFileName(fileName);
-                // 超大 TXT：整本读入做启发式切分代价高。书架扫描只需总章数与末章标题，
-                // 延迟到首次打开目录时再解析（GetChapterList 触发 GetOrAddTxt）。
-                // 这里按文件大小保守判定，避免书架加载卡顿。
-                var fi = new FileInfo(file);
-                const long LargeTxtBytes = 16L * 1024 * 1024;
-                if (fi.Length > LargeTxtBytes)
-                {
-                    totalChapters = 0;
-                    latestChapter = "未更新";
-                }
-                else
-                {
-                    try
-                    {
-                        var spans = GetOrAddTxt(file).Spans;
-                        totalChapters = spans.Count;
-                        if (spans.Count > 0) latestChapter = spans[^1].Title;
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[GetLocalBooks] TXT parse error: {file}: {ex.Message}");
-                    }
-                }
-            }
+            var info = new FileInfo(file);
+            var meta = GetOrAddShelfMeta(file, info, isEpub);
 
             var book = new Book(
-                Name: name,
-                Author: author,
+                Name: meta.Name,
+                Author: meta.Author,
                 BookUrl: $"local://{Path.GetFileName(file)}",
                 TocUrl: $"local://{Path.GetFileName(file)}",
                 Origin: "local",
                 OriginName: isEpub ? "EPUB" : "本地导入",
-                Intro: intro,
-                TotalChapterNum: totalChapters,
-                LatestChapterTitle: latestChapter,
-                ImportedAt: new DateTimeOffset(new FileInfo(file).LastWriteTimeUtc).ToUnixTimeMilliseconds()
+                Intro: meta.Intro,
+                TotalChapterNum: meta.TotalChapters,
+                LatestChapterTitle: meta.LatestChapter,
+                ImportedAt: new DateTimeOffset(info.LastWriteTimeUtc).ToUnixTimeMilliseconds()
             );
             bookshelf.Add(book);
         }
         return bookshelf;
+    }
+
+    /// <summary>
+    /// 取书架条目的元数据，按 (LastWriteTimeUtc, Length) 缓存。
+    /// EPUB 需要整本读入 + 解析末章 HTML，TXT 需要全文切分，两者都不该在每次刷新书架时重做；
+    /// 更重要的是这样 GetLocalBooks 不会把书架上每一本 EPUB 都钉进 _epubCache。
+    /// </summary>
+    private ShelfMetaCache GetOrAddShelfMeta(string file, FileInfo info, bool isEpub)
+    {
+        if (_shelfMetaCache.TryGetValue(file, out var cached) &&
+            cached.LastWriteUtc == info.LastWriteTimeUtc && cached.Length == info.Length)
+        {
+            return cached;
+        }
+
+        var fileName = Path.GetFileNameWithoutExtension(file);
+        string name = fileName;
+        string author = isEpub ? "EPUB" : "本地作者";
+        string? intro = "";
+        int totalChapters = 0;
+        string latestChapter = "未更新";
+
+        if (isEpub)
+        {
+            // 优先用 EPUB 元数据里的书名/作者/简介；解析失败回退文件名。
+            try
+            {
+                var epub = GetOrAddEpub(file);
+                if (!string.IsNullOrWhiteSpace(epub.Title)) name = epub.Title.Trim();
+                var epubAuthor = epub.Author;
+                if (!string.IsNullOrWhiteSpace(epubAuthor)) author = epubAuthor.Trim();
+                intro = epub.Description;
+                totalChapters = epub.ReadingOrder.Count;
+                if (totalChapters > 0)
+                {
+                    var lastFile = epub.ReadingOrder[totalChapters - 1];
+                    latestChapter = GetEpubChapterTitle(epub, lastFile.FilePath, totalChapters);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GetLocalBooks] EPUB metadata error: {file}: {ex.Message}");
+            }
+        }
+        else
+        {
+            // TXT 从文件名提取书名/作者，支持常见命名：《书名》作者、书名 - 作者、书名 作者：xxx。
+            (name, author) = ParseTxtFileName(fileName);
+            // 超大 TXT：整本读入做启发式切分代价高。书架扫描只需总章数与末章标题，
+            // 延迟到首次打开目录时再解析（GetChapterList 触发 GetOrAddTxt）。
+            // 这里按文件大小保守判定，避免书架加载卡顿。
+            const long LargeTxtBytes = 16L * 1024 * 1024;
+            if (info.Length <= LargeTxtBytes)
+            {
+                try
+                {
+                    var spans = GetOrAddTxt(file).Spans;
+                    totalChapters = spans.Count;
+                    if (spans.Count > 0) latestChapter = spans[^1].Title;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[GetLocalBooks] TXT parse error: {file}: {ex.Message}");
+                }
+            }
+        }
+
+        var meta = new ShelfMetaCache(
+            info.LastWriteTimeUtc, info.Length, name, author, intro, totalChapters, latestChapter);
+        _shelfMetaCache[file] = meta;
+        return meta;
     }
 
     // 《书名》后跟作者；或「书名 - 作者」；或「书名 作者：xxx」。
@@ -438,35 +560,6 @@ public partial class LocalBookService
         return chapters;
     }
 
-    public string? GetBookContent(string url, int index)
-    {
-        var filePath = ResolveLocalPath(url);
-        if (filePath == null || !File.Exists(filePath)) return null;
-
-        if (filePath.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                var epubParts = url.Split("#epub#", StringSplitOptions.RemoveEmptyEntries);
-                var targetFile = epubParts.Length > 1 ? epubParts[1] : null;
-                var book = GetOrAddEpub(filePath);
-                var textFile = targetFile == null
-                    ? index >= 0 && index < book.ReadingOrder.Count ? book.ReadingOrder[index] : null
-                    : book.ReadingOrder.FirstOrDefault(file => file.FilePath == targetFile);
-                return textFile == null ? null : ExtractEpubChapterText(textFile.Content, textFile.FilePath);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"EPUB Content Error: {ex.Message}");
-                return null;
-            }
-        }
-
-        var txt = GetOrAddTxt(filePath);
-        if (index < 0 || index >= txt.Spans.Count) return null;
-        return ReadChapterSpan(filePath, txt, txt.Spans[index]);
-    }
-
     /// <summary>
     /// 流式写出章节正文（JSON 字符串片段形式）到 chunkWriter：把章正文按块解码，
     /// 逐块回调（调用方负责 JSON 转义与 flush）。支持 EPUB 与 TXT：
@@ -524,19 +617,17 @@ public partial class LocalBookService
         return true;
     }
 
-    /// <summary>按 Span 字节范围 seek 并用 Decoder 流式解码整章正文为 string。用于搜索等需要整章文本的场景。</summary>
-    private static string ReadChapterSpan(string filePath, TxtBookCache txt, TxtChapterSpan span)
-    {
-        var sb = new StringBuilder(checked((int)span.ContentLength + 16));
-        ReadChapterSpanAsync(filePath, txt, span,
-            (mem, _) => { sb.Append(mem.Span); return Task.CompletedTask; }, CancellationToken.None).GetAwaiter().GetResult();
-        return sb.ToString();
-    }
+    /// <summary>按整本共享的读取参数打开 TXT，供逐章 seek 读取复用同一个文件句柄。</summary>
+    private static FileStream OpenTxtForReading(string filePath) =>
+        new(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: TxtByteChunk, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+    private const int TxtByteChunk = 65536;
 
     /// <summary>
     /// 按 Span 的字节范围从文件 seek 读取，用 Decoder 分块解码，逐块回调 chunkWriter。
     /// Decoder 跨块保留状态，正确处理 GB18030/UTF-16 多字节序列跨块边界。
-    /// Span.Start 已是含 BOM 的文件绝对偏移（切分时加上 BomLength），故直接 seek。
+    /// Span.Start 是含 BOM 的文件绝对偏移，故直接 seek。
     /// 解码用 ForReading(encoding) 的宽松回退副本，避免末章残缺多字节序列抛异常。
     /// </summary>
     private static async Task ReadChapterSpanAsync(
@@ -546,49 +637,10 @@ public partial class LocalBookService
         // 章节区间可能为 0（卷标题空区间被保留时），直接返回空。
         if (span.Length <= 0) return;
 
-        const int ByteChunk = 65536;
-        var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-            bufferSize: ByteChunk, options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var fs = OpenTxtForReading(filePath);
         try
         {
-            fs.Seek(span.Start, SeekOrigin.Begin);
-            var decoder = ForReading(txt.Encoding).GetDecoder();
-            var byteBuf = new byte[ByteChunk];
-            // 最坏 4 字节/char；给足空间避免 Convert 因输出缓冲不足而多次往返。
-            var charBuf = new char[ByteChunk];
-            long remaining = span.Length;
-            bool last = false;
-
-            while (remaining > 0 && !last)
-            {
-                ct.ThrowIfCancellationRequested();
-                int want = (int)Math.Min(byteBuf.Length, remaining);
-                int read = await fs.ReadAsync(byteBuf.AsMemory(0, want), ct).ConfigureAwait(false);
-                if (read <= 0) break;
-                remaining -= read;
-                last = remaining <= 0;
-
-                int bytePos = 0;
-                while (bytePos < read)
-                {
-                    decoder.Convert(byteBuf, bytePos, read - bytePos,
-                        charBuf, 0, charBuf.Length,
-                        flush: last, out int bytesUsed, out int charsUsed, out _);
-                    if (charsUsed > 0)
-                        await chunkWriter(charBuf.AsMemory(0, charsUsed), ct).ConfigureAwait(false);
-                    bytePos += bytesUsed;
-                    // 极端情况下既没消费字节也没产出字符：避免死循环。
-                    if (bytesUsed == 0 && charsUsed == 0) break;
-                }
-            }
-
-            // flush 收尾：Decoder 可能还有未完成的多字节序列需要冲刷。最后一轮 Convert 已传 flush=last，
-            // 但若末块因输出缓冲边界未冲完，这里再补一次空输入 flush。宽松回退下残缺序列替换为 U+FFFD，
-            // 不抛异常。
-            decoder.Convert(byteBuf, 0, 0, charBuf, 0, charBuf.Length,
-                flush: true, out _, out int tailChars, out _);
-            if (tailChars > 0)
-                await chunkWriter(charBuf.AsMemory(0, tailChars), ct).ConfigureAwait(false);
+            await ReadChapterSpanAsync(fs, txt, span, chunkWriter, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -596,8 +648,56 @@ public partial class LocalBookService
         }
     }
 
+    /// <summary>在调用方持有的 FileStream 上读取一章，供整本扫描（如全文搜索）复用文件句柄。</summary>
+    private static async Task ReadChapterSpanAsync(
+        FileStream fs, TxtBookCache txt, TxtChapterSpan span,
+        Func<ReadOnlyMemory<char>, CancellationToken, Task> chunkWriter, CancellationToken ct)
+    {
+        if (span.Length <= 0) return;
+
+        fs.Seek(span.Start, SeekOrigin.Begin);
+        var decoder = ForReading(txt.Encoding).GetDecoder();
+        var byteBuf = new byte[TxtByteChunk];
+        // 最坏 4 字节/char；给足空间避免 Convert 因输出缓冲不足而多次往返。
+        var charBuf = new char[TxtByteChunk];
+        var remaining = span.Length;
+        var last = false;
+
+        while (remaining > 0 && !last)
+        {
+            ct.ThrowIfCancellationRequested();
+            var want = (int)Math.Min(byteBuf.Length, remaining);
+            var read = await fs.ReadAsync(byteBuf.AsMemory(0, want), ct).ConfigureAwait(false);
+            if (read <= 0) break;
+            remaining -= read;
+            last = remaining <= 0;
+
+            var bytePos = 0;
+            while (bytePos < read)
+            {
+                decoder.Convert(byteBuf, bytePos, read - bytePos,
+                    charBuf, 0, charBuf.Length,
+                    flush: last, out var bytesUsed, out var charsUsed, out _);
+                if (charsUsed > 0)
+                    await chunkWriter(charBuf.AsMemory(0, charsUsed), ct).ConfigureAwait(false);
+                bytePos += bytesUsed;
+                // 极端情况下既没消费字节也没产出字符：避免死循环。
+                if (bytesUsed == 0 && charsUsed == 0) break;
+            }
+        }
+
+        // flush 收尾：Decoder 可能还有未完成的多字节序列需要冲刷。最后一轮 Convert 已传 flush=last，
+        // 但若末块因输出缓冲边界未冲完，这里再补一次空输入 flush。宽松回退下残缺序列替换为 U+FFFD，
+        // 不抛异常。
+        decoder.Convert(byteBuf, 0, 0, charBuf, 0, charBuf.Length,
+            flush: true, out _, out var tailChars, out _);
+        if (tailChars > 0)
+            await chunkWriter(charBuf.AsMemory(0, tailChars), ct).ConfigureAwait(false);
+    }
+
     /// <summary>搜索本地书籍已渲染的正文，返回可直接用于阅读器跳转的章内位置。</summary>
-    public List<BookContentSearchResult>? SearchBookContent(string url, string key, int maxResults)
+    public async Task<List<BookContentSearchResult>?> SearchBookContentAsync(
+        string url, string key, int maxResults, CancellationToken ct)
     {
         var filePath = ResolveLocalPath(url);
         if (filePath == null || !File.Exists(filePath)) return null;
@@ -610,9 +710,10 @@ public partial class LocalBookService
                 var book = GetOrAddEpub(filePath);
                 for (var index = 0; index < book.ReadingOrder.Count && results.Count < maxResults; index++)
                 {
+                    ct.ThrowIfCancellationRequested();
                     var textFile = book.ReadingOrder[index];
-                    var title = book.Navigation?.FirstOrDefault(node => node.Link?.ContentFilePath == textFile.FilePath)?.Title
-                        ?? $"章节 {index + 1}";
+                    // 与目录同源的标题解析，避免搜索结果里的章节名和目录对不上。
+                    var title = GetEpubChapterTitle(book, textFile.FilePath, index + 1);
                     AddChapterMatches(results, index, title,
                         ExtractEpubChapterText(textFile.Content, textFile.FilePath), key, maxResults);
                 }
@@ -621,14 +722,29 @@ public partial class LocalBookService
 
             if (!filePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return null;
             var txt = GetOrAddTxt(filePath);
-            for (var index = 0; index < txt.Spans.Count && results.Count < maxResults; index++)
+            // 整本扫描复用同一个 FileStream：长篇动辄几千章，逐章开关文件是几千次系统调用。
+            var fs = OpenTxtForReading(filePath);
+            try
             {
-                var span = txt.Spans[index];
-                AddChapterMatches(results, index, span.Title,
-                    ReadChapterSpan(filePath, txt, span), key, maxResults);
+                var sb = new StringBuilder();
+                for (var index = 0; index < txt.Spans.Count && results.Count < maxResults; index++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var span = txt.Spans[index];
+                    sb.Clear();
+                    await ReadChapterSpanAsync(fs, txt, span,
+                        (mem, _) => { sb.Append(mem.Span); return Task.CompletedTask; }, ct)
+                        .ConfigureAwait(false);
+                    AddChapterMatches(results, index, span.Title, sb.ToString(), key, maxResults);
+                }
+            }
+            finally
+            {
+                await fs.DisposeAsync().ConfigureAwait(false);
             }
             return results;
         }
+        catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
             Console.WriteLine($"Book content search error: {ex.Message}");
@@ -738,9 +854,9 @@ public partial class LocalBookService
             or BlockQuoteStart or BlockQuoteEnd or ListItemStart or ListItemEnd;
 
     /// <summary>
-    /// TXT 章节切分结果：标题、原文区间（字节偏移与字节长度，已含 BOM 调整）、分卷标记，
+    /// TXT 章节切分结果：标题、原文区间（字节偏移与字节长度）、分卷标记，
     /// 以及与阅读进度同口径的正文长度（char 计数，在切分时一次性算好，读章时不再重算）。
-    /// Start/Length 是文件内**逻辑字节偏移**（不含 BOM，调用方 seek 时加上缓存里的 BomLength）。
+    /// Start/Length 是文件内的**绝对字节偏移**（已含 BOM），可直接用于 seek。
     /// </summary>
     private readonly record struct TxtChapterSpan(
         string Title,
@@ -783,45 +899,28 @@ public partial class LocalBookService
     /// 整本 string 在本方法返回后即由调用方丢弃，不再常驻。
     /// </summary>
     private static List<TxtChapterSpan> BuildTxtChaptersWithByteOffsets(
-        string content, Encoding encoding, int bomLength)
+        string content, byte[] bytes, Encoding encoding, int bomLength)
     {
         var charSpans = BuildTxtChapters(content);
         if (charSpans.Count == 0) return charSpans;
 
-        // 一次线性扫描同时产出所有 Span 的字节偏移：维护一个游标 cursor，按 Span 的 char 起点/终点
-        // 顺序推进编码累计字节偏移。比「逐 Span 二分采样点 + 段内补差」更简单，且无需采样点表。
-        // Spans 已在 BuildTxtChapters 末尾按 Start 升序产出（hits 先排序再生成区间）。
-        var encoder = encoding.GetEncoder();
-        const int CharChunk = 8192;
-        var charBuf = new char[CharChunk];
-        var byteBuf = new byte[CharChunk * 4]; // 最坏 4 字节/char
-        long byteOffset = 0;
-        int charPos = 0;
-
-        long EncodeTo(int targetCharIndex, bool flushAtEnd)
+        // 收集每章的起止 char 索引，一次线性重放解码把它们全部翻译成字节偏移。
+        // Spans 已在 BuildTxtChapters 末尾按 Start 升序产出且互不重叠，故这个列表天然非递减，
+        // 满足 MapCharIndicesToByteOffsets 对升序的要求。
+        var indices = new List<int>(charSpans.Count * 2);
+        foreach (var s in charSpans)
         {
-            // 从 charPos 编码到 targetCharIndex，累计字节偏移。块大小受限于 CharChunk。
-            while (charPos < targetCharIndex)
-            {
-                int take = Math.Min(CharChunk, targetCharIndex - charPos);
-                content.CopyTo(charPos, charBuf, 0, take);
-                encoder.Convert(charBuf, 0, take, byteBuf, 0, byteBuf.Length,
-                    flush: flushAtEnd && charPos + take >= targetCharIndex,
-                    out _, out int bytesUsed, out _);
-                charPos += take;
-                byteOffset += bytesUsed;
-            }
-            return byteOffset;
+            indices.Add((int)s.Start);
+            indices.Add((int)(s.Start + s.Length));
         }
+        var offsets = MapCharIndicesToByteOffsets(bytes, bomLength, encoding, indices);
 
         var result = new List<TxtChapterSpan>(charSpans.Count);
-        for (int i = 0; i < charSpans.Count; i++)
+        for (var i = 0; i < charSpans.Count; i++)
         {
-            var s = charSpans[i];
-            bool isLast = i == charSpans.Count - 1;
-            long byteStart = EncodeTo((int)s.Start, flushAtEnd: false);
-            long byteEnd = EncodeTo((int)(s.Start + s.Length), flushAtEnd: isLast);
-            result.Add(s with { Start = bomLength + byteStart, Length = byteEnd - byteStart });
+            var byteStart = offsets[i * 2];
+            var byteEnd = offsets[i * 2 + 1];
+            result.Add(charSpans[i] with { Start = byteStart, Length = byteEnd - byteStart });
         }
         return result;
     }
@@ -1203,7 +1302,9 @@ public partial class LocalBookService
 
             // 规范化目标路径。与 ResolveLocalPath 不同，这里必须解码：正文里的 img src
             // 由 ExtractTextWithImages 用 Uri.AbsolutePath 生成，是 percent-escaped 的。
-            var targetPath = System.Net.WebUtility.UrlDecode(resourcePath).Replace("\\", "/").Trim().TrimStart('/');
+            // 用 UnescapeDataString 而非 WebUtility.UrlDecode：后者会把 '+' 当成空格，
+            // 文件名里含 '+' 的图片（a+b.jpg → a b.jpg）会匹配不上而 404。
+            var targetPath = UnescapePath(resourcePath).Replace("\\", "/").Trim().TrimStart('/');
             // 处理路径中的 ../
             if (targetPath.Contains("../"))
             {
@@ -1280,6 +1381,13 @@ public partial class LocalBookService
             Console.WriteLine($"[EPUB Resource Exception] url={bookUrl} path={resourcePath} ex={ex}");
         }
         return null;
+    }
+
+    /// <summary>解 percent-escape；序列非法时原样返回，不让一个坏路径把 /image 打成 500。</summary>
+    private static string UnescapePath(string path)
+    {
+        try { return Uri.UnescapeDataString(path); }
+        catch (UriFormatException) { return path; }
     }
 
     private string GetMimeType(string fileName)
@@ -1375,9 +1483,10 @@ public partial class LocalBookService
         const int height = 400;
 
         // 稳定地由标题派生一个背景色，让不同书籍的占位封面有区分度。
+        // 用掩码取正而非 Math.Abs：hash 恰为 int.MinValue 时 Math.Abs 会抛 OverflowException。
         int hash = 0;
         foreach (var ch in title) hash = unchecked(hash * 31 + ch);
-        int hue = Math.Abs(hash) % 360;
+        int hue = (hash & 0x7FFFFFFF) % 360;
 
         var lines = WrapTitle(title, 8, 5);
         // 垂直居中排布文本块。
@@ -1454,6 +1563,7 @@ public partial class LocalBookService
         // 让缓存立即失效，避免已删除的书还能翻页。
         _epubCache.TryRemove(filePath, out _);
         _txtCache.TryRemove(filePath, out _);
+        _shelfMetaCache.TryRemove(filePath, out _);
         Console.WriteLine($"[DeleteLocalBook] moved to trash: {Path.GetFileName(filePath)}");
         return true;
     }
@@ -1504,6 +1614,7 @@ public partial class LocalBookService
 
             _epubCache.TryRemove(filePath, out _);
             _txtCache.TryRemove(filePath, out _);
+            _shelfMetaCache.TryRemove(filePath, out _);
             Console.WriteLine($"[UploadBook] saved: {fileName}");
             return (true, "", bookUrl);
         }

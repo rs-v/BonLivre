@@ -42,12 +42,15 @@ export const setPassword = (password: string) => {
   else localStorage.removeItem(PASSWORD_KEY)
 }
 
-/** WebSocket 入口：http 端口 +1，协议对应升级 */
+/**
+ * WebSocket 入口：与 HTTP 同源同端口，仅升级协议。
+ * 后端在 5000/5001 上跑的是同一套路由，`/searchBook` 在 baseUrl 的端口上就能连；
+ * 早先写死「端口 +1」会让单端口部署（反向代理、HTTPS 443）永远连到不存在的 444/81。
+ */
 const wsEntryPoint = () => {
   const u = new URL(baseUrl)
-  const port = u.port ? String(Number(u.port) + 1) : u.protocol === 'https:' ? '444' : '81'
-  const protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${u.hostname}:${port}`
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
+  return u.toString().replace(/\/$/, '')
 }
 
 /**

@@ -19,10 +19,14 @@
   let searchResults = $state<SearchBook[]>([])
   let searchWord = $state('')
   let searching = $state(false)
+  // 在线搜索的 WebSocket 是否已经关闭：搜索结束但结果为空时要显示「未找到」而不是永远「搜索中…」。
+  let searchFinished = $state(false)
   let loading = $state(true)
   let connected = $state(false)
   let connectDialogOpen = $state(false)
   let uploading = $state(false)
+  let deleting = $state(false)
+  const busy = $derived(uploading || deleting)
 
   let shelfView = $state<ShelfView>(
     localStorage.getItem(SHELF_VIEW_KEY) === 'grid' ? 'grid' : 'list',
@@ -55,7 +59,7 @@
   const deleteSelected = async () => {
     if (selectedUrls.size === 0) return
     if (!confirm(`删除选中的 ${selectedUrls.size} 本书籍？文件将移入回收站。`)) return
-    uploading = true
+    deleting = true
     try {
       let failed = 0
       for (const book of shelf.filter(b => selectedUrls.has(b.bookUrl))) {
@@ -71,7 +75,7 @@
       if (failed > 0) toast(`${failed} 本删除失败`, 'error')
       else toast('已删除选中书籍', 'success')
     } finally {
-      uploading = false
+      deleting = false
     }
   }
 
@@ -134,29 +138,44 @@
   })
 
   let closeSearch: (() => void) | null = null
+  // 每次搜索一个自增号：旧 socket 关闭/出错时回调仍会触发，用它丢弃过期的回调，
+  // 否则上一轮的 onclose 会对着新一轮的空结果弹「搜索结果为空」，
+  // 迟到的 onmessage 也会把旧结果混进新列表（bookUrl 撞键还会让 {#each} 崩）。
+  let searchRequestId = 0
   const searchOnline = () => {
     if (!searchWord) return
+    const requestId = ++searchRequestId
     searching = true
+    searchFinished = false
     searchResults = []
     closeSearch?.()
     closeSearch = api.searchBooks(
       searchWord,
       books => {
+        if (requestId !== searchRequestId) return
         searchResults = [...searchResults, ...books]
       },
       () => {
+        // onclose 与 onerror 都会走到这里，连接出错时可能触发两次，用 searchFinished 去重。
+        if (requestId !== searchRequestId || searchFinished) return
+        searchFinished = true
         if (searchResults.length === 0) toast('搜索结果为空')
       },
     )
   }
 
+  const exitSearch = () => {
+    searchRequestId++
+    searching = false
+    searchFinished = false
+    searchResults = []
+    closeSearch?.()
+    closeSearch = null
+  }
+
   $effect(() => {
     // 清空搜索词时退出在线搜索模式
-    if (searchWord === '' && searching) {
-      searching = false
-      searchResults = []
-      closeSearch?.()
-    }
+    if (searchWord === '' && searching) exitSearch()
   })
 
   const recentBook = lastReadBook()
@@ -352,7 +371,13 @@
       <div class="empty body-medium">正在获取书籍信息…</div>
     {:else if visibleBooks.length === 0}
       <div class="empty body-medium">
-        {searching ? '搜索中…' : '书架空空如也，点击右下角 + 导入书籍'}
+        {#if searching && !searchFinished}
+          搜索中…
+        {:else if searching}
+          未搜索到匹配的书籍
+        {:else}
+          书架空空如也，点击右下角 + 导入书籍
+        {/if}
       </div>
     {:else}
       <div class="grid" class:grid-cover={shelfView === 'grid'}>
@@ -393,9 +418,9 @@
       </span>
       <button
         class="btn-text delete-selected"
-        disabled={selectedUrls.size === 0 || uploading}
+        disabled={selectedUrls.size === 0 || busy}
         onclick={deleteSelected}
-      >删除</button>
+      >{deleting ? '删除中…' : '删除'}</button>
     </div>
   {/if}
 
@@ -404,11 +429,13 @@
     class="fab"
     title={selectionMode ? '批量管理' : '导入书籍（.txt / .epub）'}
     aria-label={selectionMode ? '批量管理' : '导入书籍'}
-    disabled={uploading}
+    disabled={busy}
     onclick={() => (selectionMode ? exitSelection() : pickAndUpload())}
   >
     {#if uploading}
       <span class="label-medium">导入中…</span>
+    {:else if deleting}
+      <span class="label-medium">删除中…</span>
     {:else if selectionMode}
       <span class="label-medium">完成</span>
     {:else}

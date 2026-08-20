@@ -537,9 +537,20 @@
     return vol
   })
 
-  // 章节是否可见：卷折叠时隐藏子章；当前章所在卷始终展开。
-  const isChapterVisible = (volumeIndex: number) =>
-    volumesCollapsed[volumeIndex] !== true || volumeIndex === chapterVolumeIndex
+  // 章节是否可见：卷折叠时隐藏子章。
+  // 这里不能再「当前章所在的卷强制展开」——那会让用户点不动最想折叠的那个卷（点了没反应）。
+  // 改为在打开目录时把当前章所在的卷展开一次（openCatalog），之后完全听用户的。
+  const isChapterVisible = (volumeIndex: number) => volumesCollapsed[volumeIndex] !== true
+
+  const openCatalog = () => {
+    settingsOpen = false
+    contentSearchOpen = false
+    drawerTab = 'catalog'
+    if (chapterVolumeIndex >= 0 && volumesCollapsed[chapterVolumeIndex]) {
+      volumesCollapsed = { ...volumesCollapsed, [chapterVolumeIndex]: false }
+    }
+    catalogOpen = true
+  }
 
   const toChapter = async (index: number, pos = 0): Promise<boolean> => {
     if (index < 0) {
@@ -1137,12 +1148,7 @@
       </button>
       <button
         class="bar-item"
-        onclick={() => {
-          settingsOpen = false
-          contentSearchOpen = false
-          drawerTab = 'catalog'
-          catalogOpen = true
-        }}
+        onclick={openCatalog}
         aria-label="打开目录"
       >
         <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">

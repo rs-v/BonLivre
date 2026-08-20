@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text.Json;
 using System.Text;
 using Microsoft.AspNetCore.Mvc;
@@ -9,22 +10,12 @@ namespace BonLivre.Endpoints;
 
 public static class BookshelfEndpoints
 {
-    private static List<Book> _bookshelf = new();
-    // _bookshelf 采用 copy-on-write：Results.Json 在 handler 返回（锁已释放）后才真正序列化，
-    // 所以任何已交给 Results.Json 的 List 实例都不能再被原地修改；
-    // 修改一律在锁内“复制 → 改副本 → 替换引用”，锁只保护这一步。
-    private static readonly object _bookshelfLock = new();
-
     private const string ReadConfigKey = "readConfig";
     private const int MaxUploadFilesPerRequest = 10;
 
     public static void MapBookshelfEndpoints(this IEndpointRouteBuilder app)
     {
         var localService = new LocalBookService();
-        lock (_bookshelfLock)
-        {
-            _bookshelf = localService.GetLocalBooks();
-        }
         var database = app.ServiceProvider.GetRequiredService<LiteDbStore>();
         var progressStore = new BookProgressStore(database);
         var bookmarkStore = new BookmarkStore(database);
@@ -211,12 +202,6 @@ public static class BookshelfEndpoints
                 return book;
             }).ToList();
 
-            lock (_bookshelfLock)
-            {
-                _bookshelf = mergedBooks;
-            }
-            // 序列化局部 mergedBooks，而非共享字段：saveBook/deleteBook 会替换 _bookshelf 引用，
-            // 但绝不原地改动，故这个局部列表在序列化期间不会被并发修改。
             return Results.Json(new LeagdoApiResponse<List<Book>>(true, "", mergedBooks), AppJsonSerializerContext.Default.LeagdoApiResponseListBook);
         });
 
@@ -228,21 +213,13 @@ public static class BookshelfEndpoints
             return JsonSerializer.Deserialize(content, AppJsonSerializerContext.Default.Book);
         }
 
+        // saveBook：本地后端的书架完全由 books/ 目录推导（getBookshelf 每次重扫），
+        // 没有可写入的书架存储。保留端点是为了 legado 客户端「搜索结果入库」的流程不报错。
         app.MapPost("/saveBook", async (HttpRequest request) =>
         {
             try
             {
-                var book = await ReadBookAsync(request);
-                if (book != null)
-                {
-                    lock (_bookshelfLock)
-                    {
-                        // copy-on-write：新建列表并替换引用，绝不原地修改可能正被序列化的旧列表。
-                        var updated = _bookshelf.Where(b => b.BookUrl != book.BookUrl).ToList();
-                        updated.Add(book);
-                        _bookshelf = updated;
-                    }
-                }
+                await ReadBookAsync(request);
                 return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
             catch (Exception ex)
@@ -257,19 +234,11 @@ public static class BookshelfEndpoints
             try
             {
                 var book = await ReadBookAsync(request);
-                if (book != null)
+                if (book != null && book.BookUrl.StartsWith("local://"))
                 {
-                    lock (_bookshelfLock)
-                    {
-                        // copy-on-write，同 saveBook。
-                        _bookshelf = _bookshelf.Where(b => b.BookUrl != book.BookUrl).ToList();
-                    }
-                    // 仅移内存的话，下一次 getBookshelf 重扫 books/ 书又会回来。
-                    // 真正把文件移入 books/.trash/ 回收站（可手动恢复）。
-                    if (book.BookUrl.StartsWith("local://"))
-                    {
-                        localService.DeleteLocalBook(book.BookUrl);
-                    }
+                    // 书架内容每次都由 books/ 重扫得出，只从内存移除没有意义——
+                    // 必须真正把文件移进 books/.trash/ 回收站（可手动恢复）。
+                    localService.DeleteLocalBook(book.BookUrl);
                 }
                 return Results.Json(new LeagdoApiResponse<string>(true, "", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
             }
@@ -329,7 +298,7 @@ public static class BookshelfEndpoints
             }
         });
 
-        app.MapGet("/searchBookContent", (string? url, string? key) =>
+        app.MapGet("/searchBookContent", async (HttpContext ctx, string? url, string? key) =>
         {
             if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("local://", StringComparison.OrdinalIgnoreCase))
             {
@@ -353,7 +322,19 @@ public static class BookshelfEndpoints
             }
 
             const int maxResults = 100;
-            var results = localService.SearchBookContent(url, key, maxResults);
+            List<BookContentSearchResult>? results;
+            try
+            {
+                results = await localService.SearchBookContentAsync(
+                    url, key, maxResults, ctx.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "请求已取消", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+
             if (results == null)
             {
                 return Results.Json(
@@ -370,10 +351,11 @@ public static class BookshelfEndpoints
             if (url.StartsWith("local://"))
             {
                 var chapters = localService.GetChapterList(url);
-                if (chapters != null)
-                {
-                    return Results.Json(new LeagdoApiResponse<List<BookChapter>>(true, "", chapters), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter);
-                }
+                // 本地书解析失败必须如实报错：回退到模拟目录会让用户打开一本
+                // 有一章「Chapter 1」、内容是占位符的书，而不是看到出了什么问题。
+                return chapters != null
+                    ? Results.Json(new LeagdoApiResponse<List<BookChapter>>(true, "", chapters), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter)
+                    : Results.Json(new LeagdoApiResponse<List<BookChapter>>(false, "读取本地书籍目录失败，文件可能已被移动或损坏", []), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter);
             }
 
             var mockChapters = new List<BookChapter> { new BookChapter("Chapter 1", $"{url}/1", 0) };
@@ -388,10 +370,13 @@ public static class BookshelfEndpoints
             {
                 ctx.Response.ContentType = "application/json; charset=utf-8";
                 var ct = ctx.RequestAborted;
-                await using var stream = ctx.Response.Body;
+                // 不要 dispose ctx.Response.Body——它归服务器所有，而且失败回退分支
+                // 还要继续往同一个响应里写。
+                var stream = ctx.Response.Body;
                 // 直接用 UTF-8 编码的 byte 缓冲写到响应流，避免 StreamWriter 的同步 Write 路径
                 // （Kestrel 默认禁用同步 IO）。逐块转义后 WriteAsync + FlushAsync。
                 var wroteHeader = false;
+                var escapeBuffer = new ArrayBufferWriter<byte>(16 * 1024);
                 try
                 {
                     var ok = await localService.StreamChapterContentAsync(
@@ -405,7 +390,9 @@ public static class BookshelfEndpoints
                                 wroteHeader = true;
                             }
                             token.ThrowIfCancellationRequested();
-                            await WriteEscapedJsonStringChunkAsync(stream, chunk, token).ConfigureAwait(false);
+                            escapeBuffer.ResetWrittenCount();
+                            WriteEscapedJsonStringChunk(escapeBuffer, chunk.Span);
+                            await stream.WriteAsync(escapeBuffer.WrittenMemory, token).ConfigureAwait(false);
                             await stream.FlushAsync(token).ConfigureAwait(false);
                         },
                         ct);
@@ -423,14 +410,20 @@ public static class BookshelfEndpoints
                         await stream.FlushAsync(ct).ConfigureAwait(false);
                         return;
                     }
-                    // ok=false 且尚未提交响应：回退模拟正文。已写头部则不能回退，但 ok=false 时 wroteHeader 必为 false。
+                    // ok=false 时必然一块都没写出（wroteHeader 为 false），响应尚未提交，可以正常返回错误。
+                    // 本地书读不出来就如实报错，不要拿模拟正文糊弄——用户会以为书坏了却看不出原因。
+                    await Results.Json(
+                        new LeagdoApiResponse<string>(false, "读取本地章节内容失败，文件可能已被移动或损坏", ""),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseString)
+                        .ExecuteAsync(ctx);
+                    return;
                 }
                 catch (OperationCanceledException)
                 {
                     return;
                 }
             }
-            // 非 local:// 或解析失败（响应未提交）：legado 兼容回退（isSuccess 仍为 true，前端不区分真假）。
+            // 非 local://：legado 兼容回退（isSuccess 仍为 true，前端不区分真假）。
             await Results.Json(
                 new LeagdoApiResponse<string>(true, "", $"这是章节 {index} 的模拟正文内容..."),
                 AppJsonSerializerContext.Default.LeagdoApiResponseString)
@@ -498,68 +491,67 @@ public static class BookshelfEndpoints
     private static readonly byte[] EmptyDataJsonBytes = "{\"isSuccess\":true,\"errorMsg\":\"\",\"data\":\"\"}"u8.ToArray();
 
     /// <summary>
-    /// 把一段 char 内容作为 JSON 字符串值的内部片段异步写出（不含外层引号）：
+    /// 把一段 char 内容作为 JSON 字符串值的内部片段写进缓冲（不含外层引号）：
     /// 转义 "、\ 与控制字符（&lt; 0x20），其中 \n→\n、\r→\r、\t→\t，其余控制字符走 \uXXXX。
     /// 与 System.Text.Json 的字符串转义规则保持一致，使拼出的整体 JSON 合法。
-    /// 全程异步写底层流，兼容 Kestrel 禁用同步 IO。
     /// 按 rune/代理对编码：单 char 路径会把 emoji 等高平面字符拆成两个 U+FFFD。
-    /// 缓冲按最坏情况定长（代理对 4 字节 UTF-8，或控制字符 \uXXXX = 6）。
+    /// 整块转义完再由调用方一次写出——早先版本每个字符 await 一次 WriteAsync，
+    /// 一章正文就是上万次异步状态机往返。
     /// </summary>
-    private static async Task WriteEscapedJsonStringChunkAsync(Stream stream, ReadOnlyMemory<char> chunk, CancellationToken ct)
+    private static void WriteEscapedJsonStringChunk(IBufferWriter<byte> writer, ReadOnlySpan<char> chunk)
     {
-        // 代理对 UTF-8 最多 4 字节；控制字符 \uXXXX 为 6 字节。统一用 6。
-        var buf = new byte[6];
-        // 按索引遍历，避免 ReadOnlySpan 跨 await 边界。
-        for (int i = 0; i < chunk.Length; i++)
+        // 每个 char 最多产出 6 字节（控制字符 \uXXXX）；代理对两个 char 合成 4 字节，不会超。
+        var dst = writer.GetSpan(chunk.Length * 6);
+        var written = 0;
+        for (var i = 0; i < chunk.Length; i++)
         {
-            var ch = chunk.Span[i];
-            int n;
+            var ch = chunk[i];
             switch (ch)
             {
-                case '"': n = CopyAscii(buf, "\\\""u8); break;
-                case '\\': n = CopyAscii(buf, "\\\\"u8); break;
-                case '\b': n = CopyAscii(buf, "\\b"u8); break;
-                case '\f': n = CopyAscii(buf, "\\f"u8); break;
-                case '\n': n = CopyAscii(buf, "\\n"u8); break;
-                case '\r': n = CopyAscii(buf, "\\r"u8); break;
-                case '\t': n = CopyAscii(buf, "\\t"u8); break;
+                case '"': written += CopyAscii(dst[written..], "\\\""u8); break;
+                case '\\': written += CopyAscii(dst[written..], "\\\\"u8); break;
+                case '\b': written += CopyAscii(dst[written..], "\\b"u8); break;
+                case '\f': written += CopyAscii(dst[written..], "\\f"u8); break;
+                case '\n': written += CopyAscii(dst[written..], "\\n"u8); break;
+                case '\r': written += CopyAscii(dst[written..], "\\r"u8); break;
+                case '\t': written += CopyAscii(dst[written..], "\\t"u8); break;
                 case < (char)0x20:
-                    n = WriteUnicodeEscape(buf, ch);
+                    written += WriteUnicodeEscape(dst[written..], ch);
                     break;
                 default:
                     // 高代理 + 低代理成对编码为 4 字节 UTF-8；成对消费两个 char。
-                    if (char.IsHighSurrogate(ch) && i + 1 < chunk.Length && char.IsLowSurrogate(chunk.Span[i + 1]))
+                    if (char.IsHighSurrogate(ch) && i + 1 < chunk.Length && char.IsLowSurrogate(chunk[i + 1]))
                     {
-                        n = Encoding.UTF8.GetBytes(chunk.Span.Slice(i, 2), buf);
+                        written += Encoding.UTF8.GetBytes(chunk.Slice(i, 2), dst[written..]);
                         i++; // 消费低代理
                     }
                     else if (char.IsSurrogate(ch))
                     {
-                        // 孤立代理：按 JSON \uXXXX 写出，避免 Encoder 替换成 U+FFFD 丢信息。
-                        n = WriteUnicodeEscape(buf, ch);
+                        // 孤立代理（含被分块切开的代理对）：按 JSON \uXXXX 写出。
+                        // 相邻两块各写一半会拼成合法的 😀 转义对，客户端解析后仍是原字符。
+                        written += WriteUnicodeEscape(dst[written..], ch);
                     }
                     else
                     {
-                        n = Encoding.UTF8.GetBytes(chunk.Span.Slice(i, 1), buf);
+                        written += Encoding.UTF8.GetBytes(chunk.Slice(i, 1), dst[written..]);
                     }
                     break;
             }
-            if (n > 0)
-                await stream.WriteAsync(buf.AsMemory(0, n), ct).ConfigureAwait(false);
         }
+        writer.Advance(written);
 
-        static int CopyAscii(byte[] dst, ReadOnlySpan<byte> src)
+        static int CopyAscii(Span<byte> dst, ReadOnlySpan<byte> src)
         {
             src.CopyTo(dst);
             return src.Length;
         }
-        static int WriteUnicodeEscape(byte[] dst, char ch)
+        static int WriteUnicodeEscape(Span<byte> dst, char ch)
         {
             dst[0] = (byte)'\\'; dst[1] = (byte)'u';
             int v = ch;
-            for (int i = 5; i >= 2; i--)
+            for (var i = 5; i >= 2; i--)
             {
-                int h = v & 0xF;
+                var h = v & 0xF;
                 dst[i] = (byte)(h < 10 ? '0' + h : 'A' + h - 10);
                 v >>= 4;
             }
