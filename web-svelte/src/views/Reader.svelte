@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import * as api from '../lib/api'
   import { toast } from '../lib/toast.svelte'
   import { navigate } from '../lib/router.svelte'
@@ -698,8 +699,10 @@
     }
   }
 
-  $effect(() => {
-    init()
+  // 只在挂载时跑一次：init() 会同步读 reading.book（restoreReading），又会异步写回
+  // （saveProgress → persistProgressLocally），放在 $effect 里会自我触发成无限重载循环。
+  onMount(() => {
+    void init()
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') flushProgress()
     }
