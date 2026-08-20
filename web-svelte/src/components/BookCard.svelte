@@ -34,6 +34,8 @@
   const progressPercent = $derived.by(() => {
     if (!('durChapterIndex' in book)) return null
     const b = book as Book
+    // 未打开过（无进度时间）不显示 0%/1%，避免「未读却像读过」。
+    if (!b.durChapterTime || b.durChapterTime <= 0) return null
     // 超大 TXT 书架扫描时 totalChapterNum 可能为 0（延迟解析），此时不假装 100%。
     if (!b.totalChapterNum || b.totalChapterNum <= 0) return null
     // 章级概览：已抵达章（1-based）/ 总章数。读到第 1 章≈1/N，最后一章=100%。
