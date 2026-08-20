@@ -86,11 +86,22 @@ public static class PasswordAuth
         return !string.IsNullOrEmpty(queryPassword) && FixedTimeEquals(queryPassword, expected);
     }
 
-    // 常量时间比较，防时序侧信道
+    // 常量时间比较，防时序侧信道。
+    // CryptographicOperations.FixedTimeEquals 在长度不等时抛 ArgumentException，
+    // 错误密码与正确密码 UTF-8 字节长度不同会直接 500，故先对齐到定长缓冲再比较。
     private static bool FixedTimeEquals(string provided, byte[] expected)
     {
         var providedBytes = Encoding.UTF8.GetBytes(provided);
-        return CryptographicOperations.FixedTimeEquals(providedBytes, expected);
+        // 用 max 长度缓冲，两侧不足部分补 0；再额外比较真实长度，避免前缀碰撞。
+        var len = Math.Max(providedBytes.Length, expected.Length);
+        if (len == 0) return true;
+        var a = new byte[len];
+        var b = new byte[len];
+        providedBytes.CopyTo(a, 0);
+        expected.CopyTo(b, 0);
+        // 长度也纳入比较，防止 "ab" 对齐后与 "ab\0" 误判相等。
+        var lengthMatch = providedBytes.Length == expected.Length ? 1 : 0;
+        return CryptographicOperations.FixedTimeEquals(a, b) & (lengthMatch == 1);
     }
 
     private sealed record FailureLimitSettings(int Limit, TimeSpan Window, int MaxTrackedClients)
