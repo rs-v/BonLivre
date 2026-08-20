@@ -501,28 +501,49 @@ public static class BookshelfEndpoints
     /// 把一段 char 内容作为 JSON 字符串值的内部片段异步写出（不含外层引号）：
     /// 转义 "、\ 与控制字符（&lt; 0x20），其中 \n→\n、\r→\r、\t→\t，其余控制字符走 \uXXXX。
     /// 与 System.Text.Json 的字符串转义规则保持一致，使拼出的整体 JSON 合法。
-    /// 全程异步写底层流，兼容 Kestrel 禁用同步 IO。逐字符转义，每个 char 最多 6 字节（\uXXXX），
-    /// 故用一个固定 byte[] 承载单 char 的转义产物后 WriteAsync。
+    /// 全程异步写底层流，兼容 Kestrel 禁用同步 IO。
+    /// 按 rune/代理对编码：单 char 路径会把 emoji 等高平面字符拆成两个 U+FFFD。
+    /// 缓冲按最坏情况定长（代理对 4 字节 UTF-8，或控制字符 \uXXXX = 6）。
     /// </summary>
     private static async Task WriteEscapedJsonStringChunkAsync(Stream stream, ReadOnlyMemory<char> chunk, CancellationToken ct)
     {
+        // 代理对 UTF-8 最多 4 字节；控制字符 \uXXXX 为 6 字节。统一用 6。
         var buf = new byte[6];
-        // 按 char 遍历，避免 ReadOnlySpan 跨 await 边界。逐字符取 chunk.Span[i]。
+        // 按索引遍历，避免 ReadOnlySpan 跨 await 边界。
         for (int i = 0; i < chunk.Length; i++)
         {
             var ch = chunk.Span[i];
-            int n = ch switch
+            int n;
+            switch (ch)
             {
-                '"' => CopyAscii(buf, "\\\""u8),
-                '\\' => CopyAscii(buf, "\\\\"u8),
-                '\b' => CopyAscii(buf, "\\b"u8),
-                '\f' => CopyAscii(buf, "\\f"u8),
-                '\n' => CopyAscii(buf, "\\n"u8),
-                '\r' => CopyAscii(buf, "\\r"u8),
-                '\t' => CopyAscii(buf, "\\t"u8),
-                < (char)0x20 => WriteUnicodeEscape(buf, ch),
-                _ => WriteCharUtf8(buf, ch),
-            };
+                case '"': n = CopyAscii(buf, "\\\""u8); break;
+                case '\\': n = CopyAscii(buf, "\\\\"u8); break;
+                case '\b': n = CopyAscii(buf, "\\b"u8); break;
+                case '\f': n = CopyAscii(buf, "\\f"u8); break;
+                case '\n': n = CopyAscii(buf, "\\n"u8); break;
+                case '\r': n = CopyAscii(buf, "\\r"u8); break;
+                case '\t': n = CopyAscii(buf, "\\t"u8); break;
+                case < (char)0x20:
+                    n = WriteUnicodeEscape(buf, ch);
+                    break;
+                default:
+                    // 高代理 + 低代理成对编码为 4 字节 UTF-8；成对消费两个 char。
+                    if (char.IsHighSurrogate(ch) && i + 1 < chunk.Length && char.IsLowSurrogate(chunk.Span[i + 1]))
+                    {
+                        n = Encoding.UTF8.GetBytes(chunk.Span.Slice(i, 2), buf);
+                        i++; // 消费低代理
+                    }
+                    else if (char.IsSurrogate(ch))
+                    {
+                        // 孤立代理：按 JSON \uXXXX 写出，避免 Encoder 替换成 U+FFFD 丢信息。
+                        n = WriteUnicodeEscape(buf, ch);
+                    }
+                    else
+                    {
+                        n = Encoding.UTF8.GetBytes(chunk.Span.Slice(i, 1), buf);
+                    }
+                    break;
+            }
             if (n > 0)
                 await stream.WriteAsync(buf.AsMemory(0, n), ct).ConfigureAwait(false);
         }
@@ -543,12 +564,6 @@ public static class BookshelfEndpoints
                 v >>= 4;
             }
             return 6;
-        }
-        static int WriteCharUtf8(byte[] dst, char ch)
-        {
-            // 绝大多数是 BMP 单 char（含中文），按 UTF-8 编码 1~3 字节。
-            Span<char> one = stackalloc char[1] { ch };
-            return Encoding.UTF8.GetBytes(one, dst);
         }
     }
 }

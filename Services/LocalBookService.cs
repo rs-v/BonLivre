@@ -404,7 +404,15 @@ public partial class LocalBookService
                 foreach (var textFile in book.ReadingOrder)
                 {
                     string title = GetEpubChapterTitle(book, textFile.FilePath, idx + 1);
-                    epubChapters.Add(new BookChapter(title, $"{url}#epub#{textFile.FilePath}", idx++));
+                    // 与 TXT 一样给出 contentLength，供阅读器 seekMap / 全书进度条使用。
+                    // 解析成本与 getBookContent 同阶；EPUB 单章 HTML 通常不大，且结果随 Epub 缓存复用。
+                    var body = ExtractEpubChapterText(textFile.Content, textFile.FilePath);
+                    var contentLength = CalculateContentLength(body.AsSpan());
+                    epubChapters.Add(new BookChapter(
+                        title,
+                        $"{url}#epub#{textFile.FilePath}",
+                        idx++,
+                        ContentLength: contentLength));
                 }
                 return epubChapters;
             }
@@ -485,11 +493,19 @@ public partial class LocalBookService
                 if (textFile == null) return false;
                 var text = ExtractEpubChapterText(textFile.Content, textFile.FilePath).AsMemory();
                 const int ChunkChars = 8192;
-                for (int off = 0; off < text.Length; off += ChunkChars)
+                for (int off = 0; off < text.Length;)
                 {
                     ct.ThrowIfCancellationRequested();
                     var len = Math.Min(ChunkChars, text.Length - off);
+                    // 避免在代理对中间切开，否则下游 JSON UTF-8 编码会把 emoji 拆坏。
+                    if (len > 0 && len < text.Length - off &&
+                        char.IsHighSurrogate(text.Span[off + len - 1]))
+                    {
+                        len--;
+                    }
+                    if (len <= 0) len = Math.Min(ChunkChars, text.Length - off);
                     await chunkWriter(text.Slice(off, len), ct).ConfigureAwait(false);
+                    off += len;
                 }
                 return true;
             }
@@ -660,7 +676,8 @@ public partial class LocalBookService
             var line = rawLine.Trim();
             if (line.Length == 0) continue;
 
-            // 进度口径：按含标记原文计可见字数（与阅读器 visibleLength 一致）。
+            // 进度口径：按含标记原文计可见字数（与阅读器 visibleLength / CalculateContentLength 一致）。
+            // 图片 / hr 行也推进 position，但不参与关键字匹配。
             position += CountVisibleChars(line) + 1;
             if (IsMarkerLine(line)) continue;
 
@@ -1048,7 +1065,9 @@ public partial class LocalBookService
     [GeneratedRegex(@"^番\s*[零〇○一二三四五六七八九十百千万0-9]{1,8}", RegexOptions.CultureInvariant)]
     private static partial Regex FanNumberRegex();
 
-    /// <summary>按阅读器的段落规则计算章内进度范围：trim、忽略空行，每段长度加一。</summary>
+    /// <summary>按阅读器的段落规则计算章内进度范围：trim、忽略空行，每段长度加一。
+    /// 图片行 / &lt;hr&gt; 也计入（与 Reader.svelte splitContent 一致），否则 seekMap
+    /// 与搜索定位会相对章末偏移。</summary>
     private static int CalculateContentLength(ReadOnlySpan<char> content)
     {
         var total = 0;
@@ -1056,8 +1075,9 @@ public partial class LocalBookService
         {
             int newline = content.IndexOf('\n');
             var line = (newline >= 0 ? content[..newline] : content).Trim();
-            // 忽略内联强调占位标记与图片/分隔线标记，统计纯文本字数。
-            if (!line.IsEmpty && !IsMarkerLine(line))
+            // 与前端 visibleLength 一致：剥离私有占位标记后的可见字数 +1（换行）。
+            // 图片 / hr 标记行本身也是段落（有 endPos），必须计入。
+            if (!line.IsEmpty)
             {
                 total = checked(total + CountVisibleChars(line) + 1);
             }
