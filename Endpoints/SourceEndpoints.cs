@@ -130,6 +130,12 @@ public static class SourceEndpoints
                                 var responseBytes = Encoding.UTF8.GetBytes(responseJson);
                                 await webSocket.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
                                 Console.WriteLine($"[WebSocket] Sent {searchResults.Count} results.");
+
+                                // 本地搜索是同步、一次性的：结果已全部发出，关闭连接以通知客户端搜索结束。
+                                // legado 与前端都把 socket 关闭当作「搜索完成」信号；不关会让前端永远停在
+                                // 「搜索中…」（空结果时尤其明显），onclose/onerror 里的收尾逻辑也不会触发。
+                                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Search done", CancellationToken.None);
+                                break;
                             }
                         }
                     }

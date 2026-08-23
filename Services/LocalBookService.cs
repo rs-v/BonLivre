@@ -1034,7 +1034,13 @@ public partial class LocalBookService
             int end = (i + 1 < hits.Count) ? hits[i + 1].Index : content.Length;
             var body = content.AsSpan(start, end - start);
             var contentLength = CalculateContentLength(body);
-            bool hasBody = contentLength > hits[i].Title.Length + 1;
+            // 空章判定：标题行之后是否还有非空正文。不能用 contentLength 与 Title.Length 比较——
+            // Title 是正则捕获组（不含 【】/☆/◎ 等装饰），而 contentLength 按整行可见字数计，
+            // 装饰标题会让阈值偏低，把"只有标题一行"的章误判为有正文，空章不被合并。
+            // 直接取标题行之后的余段计长：有任意非空行才算有正文。
+            var firstNl = body.IndexOf('\n');
+            var afterTitle = firstNl < 0 ? ReadOnlySpan<char>.Empty : body[(firstNl + 1)..];
+            bool hasBody = CalculateContentLength(afterTitle) > 0;
             spans.Add(new TxtChapterSpan(
                 hits[i].Title,
                 start,
