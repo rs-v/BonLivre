@@ -177,7 +177,7 @@ How the credential is transmitted:
 
 #### Source Compatibility Endpoints
 - `GET /getBookSources` and `POST /saveBookSource` - Compatibility stubs; remote-source management is not implemented
-- `WS /searchBook` - Search locally available book titles and authors over WebSocket
+- `WS /searchBook` - Search locally available book titles and authors over WebSocket. The server streams the full result set (possibly empty) and then closes the connection, which the client treats as the "search finished" signal.
 
 ### 🔧 Development
 
@@ -407,10 +407,15 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 - HTTP 请求通过 `Authorization: Bearer <密码>` 请求头携带。
 - WebSocket、图片（`<img src>`）、`sendBeacon` 请求通过 `?password=` 查询参数携带，因为浏览器无法为这些请求设置自定义请求头。
 
+密码比较采用常量时间算法，防时序侧信道。
+
 ⚠️ **安全提示：**
 - 无 HTTPS 时密码为明文传输。请仅在可信局域网使用，或为后端套用 HTTPS / 加密隧道。
 - 查询参数中的密码可能出现在反向代理或访问日志中。
-- 不做登录失败限流或锁定。本功能面向局域网/个人使用，不适合公网暴露。
+- 设置 `BONLIVRE_PASSWORD` 后，共享密码中间件会保护所有 API 与 WebSocket 端点，包括上传/删除操作及本地封面/图片资源。静态前端文件、`/`、`/health` 与 CORS 预检请求保持公开。
+- 失败的密码尝试按直连客户端 IP 限流：默认 5 分钟内 10 次失败返回 `401`，超出后返回 `429 Too Many Requests` 并附带 `Retry-After`。正确的凭证永不被限流。可通过 `BONLIVRE_AUTH_FAILURE_LIMIT`、`BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`、`BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS` 自定义。
+- 客户端地址取自直连 TCP 连接。默认有意不信任转发 IP 头。
+- 未设置 `BONLIVRE_PASSWORD` 时仍为开放模式，所有 API 端点均公开。此为局域网/个人使用设计，不适合公网暴露。
 
 ### 🔌 API 端点
 
@@ -433,7 +438,7 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 
 #### 书源兼容端点
 - `GET /getBookSources`、`POST /saveBookSource` - 兼容性存根；尚未实现远程书源管理
-- `WS /searchBook` - 通过 WebSocket 搜索本地已有图书的书名和作者
+- `WS /searchBook` - 通过 WebSocket 搜索本地已有图书的书名和作者。服务端会流式发出完整结果集（可能为空）后关闭连接，客户端以此作为「搜索完成」信号。
 
 ### 🔧 开发
 
