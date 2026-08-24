@@ -7,18 +7,33 @@ namespace BonLivre.Configuration;
 
 /// <summary>
 /// 单一共享密码认证。密码从环境变量 BONLIVRE_PASSWORD 读取。
-/// 凭证支持两条通道：HTTP 走 Authorization: Bearer &lt;pw&gt; header，
-/// 浏览器无法设置 header 的场景（WebSocket、&lt;img src&gt;、sendBeacon）走 ?password= query。
+/// 凭证只走 Authorization: Bearer &lt;pw&gt; header——查询参数会落入 URL 与访问日志，
+/// 故不再提供 ?password= 通道。浏览器无法设置 header 的场景各有专责：
+/// WebSocket 握手由 /searchBook 处理器在首条消息内自行认证，图片改用 fetch+blob。
 /// </summary>
 public static class PasswordAuth
 {
     public const string EnvVarName = "BONLIVRE_PASSWORD";
+
+    /// <summary>
+    /// WS 握手无法携带 Authorization header，此路径豁免中间件强制认证，
+    /// 由处理器校验首条消息内的密码并复用同一套失败限流。
+    /// </summary>
+    public const string FirstMessageAuthPath = "/searchBook";
+
     private const int DefaultFailureLimit = 10;
     private const int DefaultFailureWindowSeconds = 300;
     private const int DefaultMaxTrackedClients = 4096;
     private const int MaximumFailureLimit = 1000;
     private const int MaximumFailureWindowSeconds = 86400;
     private const int MaximumTrackedClients = 65536;
+
+    // 启动时在 UseSharedPasswordAuth 中一次性赋值，此后只读；null 表示开放模式。
+    private static byte[]? _expected;
+    private static FailedAuthenticationLimiter? _limiter;
+
+    /// <summary>未设置 BONLIVRE_PASSWORD 时为开放模式，一切请求放行。</summary>
+    public static bool IsOpenMode => _expected is null;
 
     public static void UseSharedPasswordAuth(this WebApplication app)
     {
@@ -32,29 +47,28 @@ public static class PasswordAuth
             return;
         }
 
-        var settings = FailureLimitSettings.FromEnvironment();
-        var failureLimiter = new FailedAuthenticationLimiter(settings);
-        var expected = Encoding.UTF8.GetBytes(password);
+        _expected = Encoding.UTF8.GetBytes(password);
+        _limiter = new FailedAuthenticationLimiter(FailureLimitSettings.FromEnvironment());
 
         app.Use(async (context, next) =>
         {
             var path = context.Request.Path;
 
-            // 放行 CORS 预检（否则跨域请求会被拦截）、根路径与 /health 存活探测
-            if (HttpMethods.IsOptions(context.Request.Method) || path == "/" || path == "/health")
+            // 放行 CORS 预检（否则跨域请求会被拦截）、根路径、/health 存活探测与首条消息认证的 WS 路径
+            if (HttpMethods.IsOptions(context.Request.Method)
+                || path == "/" || path == "/health" || path == FirstMessageAuthPath)
             {
                 await next();
                 return;
             }
 
-            if (IsAuthorized(context, expected))
+            if (IsRequestAuthorized(context))
             {
                 await next();
                 return;
             }
 
-            var client = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            if (failureLimiter.TryRegisterFailure(client, out var retryAfter))
+            if (TryRegisterFailure(context, out var retryAfter))
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsJsonAsync(
@@ -71,19 +85,30 @@ public static class PasswordAuth
         });
     }
 
-    private static bool IsAuthorized(HttpContext context, byte[] expected)
+    /// <summary>HTTP 通道：仅认 Authorization: Bearer &lt;pw&gt;。开放模式下恒为 true。</summary>
+    public static bool IsRequestAuthorized(HttpContext context)
     {
-        // 1. HTTP 通道：Authorization: Bearer <pw>
-        var authHeader = context.Request.Headers.Authorization.ToString();
-        if (authHeader.StartsWith("Bearer ", StringComparison.Ordinal))
-        {
-            var token = authHeader.Substring("Bearer ".Length);
-            if (FixedTimeEquals(token, expected)) return true;
-        }
+        var expected = _expected;
+        if (expected is null) return true;
 
-        // 2. 浏览器无 header 通道：?password=
-        var queryPassword = context.Request.Query["password"].ToString();
-        return !string.IsNullOrEmpty(queryPassword) && FixedTimeEquals(queryPassword, expected);
+        var authHeader = context.Request.Headers.Authorization.ToString();
+        if (!authHeader.StartsWith("Bearer ", StringComparison.Ordinal)) return false;
+        return FixedTimeEquals(authHeader.Substring("Bearer ".Length), expected);
+    }
+
+    /// <summary>WS 首条消息通道：校验消息携带的明文密码。开放模式下恒为 true。</summary>
+    public static bool TryValidate(string candidate)
+    {
+        var expected = _expected;
+        if (expected is null) return true;
+        return !string.IsNullOrEmpty(candidate) && FixedTimeEquals(candidate, expected);
+    }
+
+    /// <summary>登记一次认证失败（按来源 IP 限流）。返回 false 表示已超限，应拒绝并提示稍后再试。</summary>
+    public static bool TryRegisterFailure(HttpContext context, out TimeSpan retryAfter)
+    {
+        var client = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return _limiter!.TryRegisterFailure(client, out retryAfter);
     }
 
     // 常量时间比较，防时序侧信道。

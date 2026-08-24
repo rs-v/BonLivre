@@ -69,19 +69,40 @@ public static class BookshelfEndpoints
             }
         });
 
-        app.MapGet("/getBookmarks", (string? bookUrl) =>
+        // 敏感参数（bookUrl）走 POST body，避免出现在 URL 与访问日志中。下同。
+        app.MapPost("/getBookmarks", async (HttpRequest request) =>
         {
-            if (string.IsNullOrWhiteSpace(bookUrl))
+            try
             {
+                var query = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.GetBookmarksRequest,
+                    request.HttpContext.RequestAborted);
+                if (query == null || string.IsNullOrWhiteSpace(query.BookUrl))
+                {
+                    return Results.Json(
+                        new LeagdoApiResponse<List<Bookmark>>(false, "缺少书籍地址", []),
+                        AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+                }
+
+                var bookmarks = bookmarkStore.GetByBookUrl(query.BookUrl);
                 return Results.Json(
-                    new LeagdoApiResponse<List<Bookmark>>(false, "缺少书籍地址", []),
+                    new LeagdoApiResponse<List<Bookmark>>(true, "", bookmarks),
                     AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
             }
-
-            var bookmarks = bookmarkStore.GetByBookUrl(bookUrl);
-            return Results.Json(
-                new LeagdoApiResponse<List<Bookmark>>(true, "", bookmarks),
-                AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<Bookmark>>(false, "请求已取消", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[getBookmarks Error]: {ex}");
+                return Results.Json(
+                    new LeagdoApiResponse<List<Bookmark>>(false, "读取书签失败", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookmark);
+            }
         });
 
         app.MapPost("/createBookmark", async (HttpRequest request) =>
@@ -250,9 +271,9 @@ public static class BookshelfEndpoints
         });
 
         // 上传书籍：multipart/form-data，字段名任意，取每个上传文件的原始文件名存入 books/。
-        // ?overwrite=true 允许覆盖同名文件。前端暂无对应入口，供脚本/curl 使用：
-        //   curl -F "file=@book.epub" http://host:5000/uploadBook
-        app.MapPost("/uploadBook", async (HttpRequest request, bool? overwrite) =>
+        // 表单字段 overwrite=true 允许覆盖同名文件（参数走 body 不走 URL）。前端暂无对应入口，供脚本/curl 使用：
+        //   curl -F "file=@book.epub" -F "overwrite=true" http://host:5000/uploadBook
+        app.MapPost("/uploadBook", async (HttpRequest request) =>
         {
             try
             {
@@ -262,6 +283,7 @@ public static class BookshelfEndpoints
                 }
 
                 var form = await request.ReadFormAsync(request.HttpContext.RequestAborted);
+                bool.TryParse(form["overwrite"], out var overwrite);
                 if (form.Files.Count == 0)
                 {
                     return Results.Json(new LeagdoApiResponse<string>(false, "未收到文件", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
@@ -278,7 +300,7 @@ public static class BookshelfEndpoints
                 {
                     await using var stream = file.OpenReadStream();
                     var (ok, message, bookUrl) = await localService.SaveUploadedBookAsync(
-                        file.FileName, stream, overwrite == true);
+                        file.FileName, stream, overwrite);
                     if (!ok)
                     {
                         return Results.Json(new LeagdoApiResponse<string>(false, $"{file.FileName}: {message}", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
@@ -298,8 +320,33 @@ public static class BookshelfEndpoints
             }
         });
 
-        app.MapGet("/searchBookContent", async (HttpContext ctx, string? url, string? key) =>
+        // 搜索词是用户输入内容，同样只走 body。
+        app.MapPost("/searchBookContent", async (HttpRequest request) =>
         {
+            BookContentSearchRequest? searchRequest;
+            try
+            {
+                searchRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.BookContentSearchRequest,
+                    request.HttpContext.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "请求已取消", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[searchBookContent Error]: {ex.Message}");
+                return Results.Json(
+                    new LeagdoApiResponse<List<BookContentSearchResult>>(false, "解析搜索请求失败", []),
+                    AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
+            }
+
+            var url = searchRequest?.Url;
+            var key = searchRequest?.Key?.Trim();
             if (string.IsNullOrWhiteSpace(url) || !url.StartsWith("local://", StringComparison.OrdinalIgnoreCase))
             {
                 return Results.Json(
@@ -307,7 +354,6 @@ public static class BookshelfEndpoints
                     AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
             }
 
-            key = key?.Trim();
             if (string.IsNullOrEmpty(key))
             {
                 return Results.Json(
@@ -326,7 +372,7 @@ public static class BookshelfEndpoints
             try
             {
                 results = await localService.SearchBookContentAsync(
-                    url, key, maxResults, ctx.RequestAborted);
+                    url, key, maxResults, request.HttpContext.RequestAborted);
             }
             catch (OperationCanceledException)
             {
@@ -346,8 +392,27 @@ public static class BookshelfEndpoints
                 AppJsonSerializerContext.Default.LeagdoApiResponseListBookContentSearchResult);
         });
 
-        app.MapGet("/getChapterList", (string url) =>
+        app.MapPost("/getChapterList", async (HttpRequest request) =>
         {
+            ChapterListRequest? listRequest;
+            try
+            {
+                listRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.ChapterListRequest,
+                    request.HttpContext.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(new LeagdoApiResponse<List<BookChapter>>(false, "请求已取消", []), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[getChapterList Error]: {ex.Message}");
+                return Results.Json(new LeagdoApiResponse<List<BookChapter>>(false, "解析目录请求失败", []), AppJsonSerializerContext.Default.LeagdoApiResponseListBookChapter);
+            }
+
+            var url = listRequest?.Url ?? "";
             if (url.StartsWith("local://"))
             {
                 var chapters = localService.GetChapterList(url);
@@ -364,15 +429,47 @@ public static class BookshelfEndpoints
 
         // 分块流式写出正文：手写 JSON 到响应流，章正文逐块做 JSON 字符串转义后 flush，
         // 避免 Results.Json 把整章 string 整体缓冲成大 byte[]。对前端透明（fetch().json() 自动拼合 chunked）。
-        app.MapGet("/getBookContent", async (HttpContext ctx, string url, int index) =>
+        app.MapPost("/getBookContent", async (HttpContext ctx, HttpRequest request) =>
         {
+            BookContentRequest? contentRequest;
+            try
+            {
+                contentRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.BookContentRequest,
+                    ctx.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                return Results.Json(new LeagdoApiResponse<string>(false, "请求已取消", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[getBookContent Error]: {ex.Message}");
+                return Results.Json(new LeagdoApiResponse<string>(false, "解析章节请求失败", ""), AppJsonSerializerContext.Default.LeagdoApiResponseString);
+            }
+
+            var url = contentRequest?.Url ?? "";
+            var index = contentRequest?.Index ?? 0;
             if (url.StartsWith("local://"))
             {
-                ctx.Response.ContentType = "application/json; charset=utf-8";
-                var ct = ctx.RequestAborted;
+                await StreamLocalChapterAsync(ctx, url, index);
+                return Results.Empty;
+            }
+            // 非 local://：legado 兼容回退（isSuccess 仍为 true，前端不区分真假）。
+            await Results.Json(
+                new LeagdoApiResponse<string>(true, "", $"这是章节 {index} 的模拟正文内容..."),
+                AppJsonSerializerContext.Default.LeagdoApiResponseString)
+                .ExecuteAsync(ctx);
+            return Results.Empty;
+
+            async Task StreamLocalChapterAsync(HttpContext context, string bookUrl, int chapterIndex)
+            {
+                context.Response.ContentType = "application/json; charset=utf-8";
+                var ct = context.RequestAborted;
                 // 不要 dispose ctx.Response.Body——它归服务器所有，而且失败回退分支
                 // 还要继续往同一个响应里写。
-                var stream = ctx.Response.Body;
+                var stream = context.Response.Body;
                 // 直接用 UTF-8 编码的 byte 缓冲写到响应流，避免 StreamWriter 的同步 Write 路径
                 // （Kestrel 默认禁用同步 IO）。逐块转义后 WriteAsync + FlushAsync。
                 var wroteHeader = false;
@@ -380,7 +477,7 @@ public static class BookshelfEndpoints
                 try
                 {
                     var ok = await localService.StreamChapterContentAsync(
-                        url, index,
+                        bookUrl, chapterIndex,
                         async (chunk, token) =>
                         {
                             if (!wroteHeader)
@@ -415,23 +512,33 @@ public static class BookshelfEndpoints
                     await Results.Json(
                         new LeagdoApiResponse<string>(false, "读取本地章节内容失败，文件可能已被移动或损坏", ""),
                         AppJsonSerializerContext.Default.LeagdoApiResponseString)
-                        .ExecuteAsync(ctx);
-                    return;
+                        .ExecuteAsync(context);
                 }
                 catch (OperationCanceledException)
                 {
-                    return;
                 }
             }
-            // 非 local://：legado 兼容回退（isSuccess 仍为 true，前端不区分真假）。
-            await Results.Json(
-                new LeagdoApiResponse<string>(true, "", $"这是章节 {index} 的模拟正文内容..."),
-                AppJsonSerializerContext.Default.LeagdoApiResponseString)
-                .ExecuteAsync(ctx);
         });
 
-        app.MapGet("/cover", (string path) =>
+        // 封面与 EPUB 内嵌图片：浏览器无法在 <img> 请求上带 Authorization header，
+        // 前端改用 fetch+blob 加载，参数随之从 query 移入 body。
+        app.MapPost("/cover", async (HttpRequest request) =>
         {
+            CoverRequest? coverRequest;
+            try
+            {
+                coverRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.CoverRequest,
+                    request.HttpContext.RequestAborted);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[cover Error]: {ex.Message}");
+                return Results.NotFound();
+            }
+
+            var path = coverRequest?.Path ?? "";
             if (path.StartsWith("local://"))
             {
                 if (path.EndsWith(".epub", StringComparison.OrdinalIgnoreCase))
@@ -445,17 +552,32 @@ public static class BookshelfEndpoints
                 var svg = LocalBookService.GenerateTitleCoverSvg(title);
                 return Results.File(svg, "image/svg+xml");
             }
-            // 非本地封面：仅允许重定向到合法的 http(s) 绝对地址，避免开放重定向。
-            if (Uri.TryCreate(path, UriKind.Absolute, out var uri) &&
-                (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
-            {
-                return Results.Redirect(uri.AbsoluteUri);
-            }
+            // 外部 http(s) 封面由前端直连第三方，不再提供服务器端跳转。
             return Results.NotFound();
         });
 
-        app.MapGet("/image", (string url, string path, int? width) =>
+        app.MapPost("/image", async (HttpRequest request) =>
         {
+            EpubImageRequest? imageRequest;
+            try
+            {
+                imageRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.EpubImageRequest,
+                    request.HttpContext.RequestAborted);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Image EndPoint Critical Error]: {ex.Message}");
+                return Results.Problem(
+                    detail: "读取图片资源失败",
+                    statusCode: 500,
+                    title: "EPUB Image Resource Error"
+                );
+            }
+
+            var url = imageRequest?.Url ?? "";
+            var path = imageRequest?.Path ?? "";
             try
             {
                 if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(path))
@@ -473,7 +595,8 @@ public static class BookshelfEndpoints
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Image EndPoint Critical Error]: url={url}, path={path}\n{ex}");
+                // 只记异常不记 url/path：书名属于用户隐私，不应落入控制台日志。
+                Console.WriteLine($"[Image EndPoint Critical Error]: {ex}");
                 return Results.Problem(
                     detail: "读取图片资源失败",
                     statusCode: 500,

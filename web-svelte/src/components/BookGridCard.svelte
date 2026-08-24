@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Book, SearchBook } from '../lib/types'
-  import { coverUrl } from '../lib/api'
+  import * as api from '../lib/api'
+  import RemoteImage from './RemoteImage.svelte'
 
   let {
     book,
@@ -16,11 +17,9 @@
     selecting?: boolean
   } = $props()
 
-  const cover = $derived(
-    book.coverUrl && /^https?:/.test(book.coverUrl)
-      ? book.coverUrl
-      : coverUrl(book.coverUrl || book.bookUrl),
-  )
+  // 外部 http(s) 封面直连第三方（无凭证）；本地封面走认证 blob 加载，参数不进 URL
+  const externalCover = $derived(!!book.coverUrl && /^https?:/.test(book.coverUrl))
+  const coverPath = $derived(externalCover ? '' : book.coverUrl || book.bookUrl)
 
   const progressText = $derived.by(() => {
     if (!('durChapterTitle' in book)) return ''
@@ -52,7 +51,12 @@
   onkeydown={e => e.key === 'Enter' && onclick()}
 >
   <div class="cover-wrap">
-    <img class="cover" src={cover} alt={book.name} loading="lazy" />
+    <RemoteImage
+      class="cover"
+      alt={book.name}
+      src={externalCover ? book.coverUrl : undefined}
+      loadBlob={externalCover ? undefined : () => api.fetchCover(coverPath)}
+    />
     {#if selecting}
       <span class="select-check" class:checked={selected} aria-hidden="true">
         {selected ? '✓' : ''}
@@ -142,7 +146,8 @@
     border-color: var(--md-primary);
   }
 
-  .cover {
+  /* 封面元素在 RemoteImage 模板内拿不到本组件 scope hash，须用 :global 锚定 */
+  .cover-wrap :global(.cover) {
     width: 100%;
     height: 100%;
     object-fit: cover;

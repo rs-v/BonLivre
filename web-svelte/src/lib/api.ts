@@ -54,16 +54,9 @@ const wsEntryPoint = () => {
 }
 
 /**
- * 为无法设置 header 的 URL（WebSocket、<img src>、sendBeacon）追加 ?password=。
- * 常规请求走 Authorization: Bearer header。
+ * 凭证只走 Authorization: Bearer header；敏感参数一律放请求体，
+ * 避免 URL 进入浏览器历史与服务器访问日志。
  */
-const withPassword = (url: string): string => {
-  const password = getPassword()
-  if (!password) return url
-  const u = new URL(url)
-  u.searchParams.set('password', password)
-  return u.toString()
-}
 
 class ApiError extends Error {
   constructor(
@@ -98,22 +91,35 @@ const postJson = <T>(path: string, body: unknown) =>
     body: JSON.stringify(body),
   })
 
+/** 二进制响应（封面、EPUB 图片）不走 LeagdoApiResponse 包装，直接返回 blob。 */
+const postBlob = async (path: string, body: unknown, signal?: AbortSignal): Promise<Blob> => {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  const password = getPassword()
+  if (password) headers.set('Authorization', `Bearer ${password}`)
+
+  const resp = await fetch(`${baseUrl}/${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (resp.status === 401) throw new ApiError('密码错误或缺失', 401)
+  if (!resp.ok) throw new ApiError(`请求失败（${resp.status}）`, resp.status)
+  return await resp.blob()
+}
+
 // ---------- 书架 ----------
 
 export const getBookshelf = () => request<Book[]>('getBookshelf')
 
 export const getChapterList = (bookUrl: string) =>
-  request<BookChapter[]>(`getChapterList?url=${encodeURIComponent(bookUrl)}`)
+  postJson<BookChapter[]>('getChapterList', { url: bookUrl })
 
 export const getBookContent = (bookUrl: string, index: number) =>
-  request<string>(
-    `getBookContent?url=${encodeURIComponent(bookUrl)}&index=${index}`,
-  )
+  postJson<string>('getBookContent', { url: bookUrl, index })
 
 export const searchBookContent = (bookUrl: string, key: string) =>
-  request<BookContentSearchResult[]>(
-    `searchBookContent?url=${encodeURIComponent(bookUrl)}&key=${encodeURIComponent(key)}`,
-  )
+  postJson<BookContentSearchResult[]>('searchBookContent', { url: bookUrl, key })
 
 export const saveBook = (book: Book | SearchBook) => postJson<string>('saveBook', book)
 export const deleteBook = (book: Book) => postJson<string>('deleteBook', book)
@@ -121,7 +127,9 @@ export const deleteBook = (book: Book) => postJson<string>('deleteBook', book)
 export const uploadBook = async (files: File[], overwrite = false) => {
   const formData = new FormData()
   for (const file of files) formData.append('file', file, file.name)
-  return request<string>(`uploadBook${overwrite ? '?overwrite=true' : ''}`, {
+  // overwrite 也走表单字段，保持「敏感/业务参数不进 URL」的约定
+  if (overwrite) formData.append('overwrite', 'true')
+  return request<string>('uploadBook', {
     method: 'POST',
     body: formData,
   })
@@ -130,7 +138,7 @@ export const uploadBook = async (files: File[], overwrite = false) => {
 // ---------- 书签、进度与配置 ----------
 
 export const getBookmarks = (bookUrl: string) =>
-  request<Bookmark[]>(`getBookmarks?bookUrl=${encodeURIComponent(bookUrl)}`)
+  postJson<Bookmark[]>('getBookmarks', { bookUrl })
 
 export const createBookmark = (bookmark: CreateBookmarkRequest) =>
   postJson<Bookmark>('createBookmark', bookmark)
@@ -157,36 +165,40 @@ export const saveReadConfig = (config: ReadConfig) =>
 export const saveBookProgress = (progress: BookProgress) =>
   postJson<string>('saveBookProgress', progress)
 
-/** 页面关闭/切后台时尽力保存进度；Beacon 无法入队时回退到 keepalive 请求。 */
-export const saveBookProgressWithBeacon = (progress: BookProgress): boolean => {
-  const url = withPassword(`${baseUrl}/saveBookProgress`)
-  const body = JSON.stringify(progress)
-  const queued = navigator.sendBeacon(url, body)
-  if (!queued) {
-    void fetch(url, { method: 'POST', body, keepalive: true }).catch(() => {})
-  }
-  return queued
+/**
+ * 页面关闭/切后台时尽力保存进度。sendBeacon 无法携带 Authorization header，
+ * 改用 keepalive fetch：header 与 JSON body 齐全，页面卸载后仍能完成请求。
+ */
+export const saveProgressKeepalive = (progress: BookProgress): void => {
+  void fetch(`${baseUrl}/saveBookProgress`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getPassword()}` },
+    body: JSON.stringify(progress),
+    keepalive: true,
+  }).catch(() => {})
 }
 
-// ---------- 资源 URL（<img src> 直连，带密码 query） ----------
+// ---------- 认证资源加载（fetch+blob，参数与凭证均不进 URL） ----------
 
-export const coverUrl = (path: string) =>
-  withPassword(`${baseUrl}/cover?path=${encodeURIComponent(path)}`)
+/** 书籍封面（EPUB 内嵌封面或按标题生成的 SVG 占位图）。 */
+export const fetchCover = (path: string, signal?: AbortSignal) =>
+  postBlob('cover', { path }, signal)
 
-export const epubImageUrl = (bookUrl: string, src: string) =>
-  withPassword(
-    `${baseUrl}/image?url=${encodeURIComponent(bookUrl)}&path=${encodeURIComponent(src)}&width=600`,
-  )
+/** EPUB 内嵌图片资源。 */
+export const fetchEpubImage = (bookUrl: string, src: string, signal?: AbortSignal) =>
+  postBlob('image', { url: bookUrl, path: src }, signal)
 
 // ---------- WebSocket 搜索 ----------
 
 export const searchBooks = (
   key: string,
   onReceive: (books: SearchBook[]) => void,
-  onFinish: () => void,
+  onFinish: (closeCode?: number) => void,
 ) => {
-  const socket = new WebSocket(withPassword(`${wsEntryPoint()}/searchBook`))
-  socket.onopen = () => socket.send(JSON.stringify({ key }))
+  // 浏览器无法在 WS 握手时携带自定义 header，密码随首条消息发送，
+  // 不再拼进握手 URL；开放模式下 password 字段为 undefined，序列化时自动省略。
+  const socket = new WebSocket(`${wsEntryPoint()}/searchBook`)
+  socket.onopen = () => socket.send(JSON.stringify({ key, password: getPassword() || undefined }))
   socket.onmessage = event => {
     try {
       onReceive(JSON.parse(event.data))
@@ -194,7 +206,8 @@ export const searchBooks = (
       /* 非 JSON 消息忽略 */
     }
   }
-  socket.onclose = onFinish
-  socket.onerror = onFinish
+  // closeCode 1008 = 密码错误/缺失（服务端 PolicyViolation）
+  socket.onclose = event => onFinish(event.code)
+  socket.onerror = () => onFinish()
   return () => socket.close()
 }

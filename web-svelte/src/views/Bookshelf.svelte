@@ -155,11 +155,13 @@
         if (requestId !== searchRequestId) return
         searchResults = [...searchResults, ...books]
       },
-      () => {
+      closeCode => {
         // onclose 与 onerror 都会走到这里，连接出错时可能触发两次，用 searchFinished 去重。
         if (requestId !== searchRequestId || searchFinished) return
         searchFinished = true
-        if (searchResults.length === 0) toast('搜索结果为空')
+        // 1008 = 服务端首条消息认证失败（密码错误或缺失）
+        if (closeCode === 1008) toast('搜索密码错误或缺失', 'error')
+        else if (searchResults.length === 0) toast('搜索结果为空')
       },
     )
   }

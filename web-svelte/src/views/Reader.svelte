@@ -3,6 +3,7 @@
   import * as api from '../lib/api'
   import { toast } from '../lib/toast.svelte'
   import { navigate } from '../lib/router.svelte'
+  import RemoteImage from '../components/RemoteImage.svelte'
   import {
     reading,
     bookmarks,
@@ -327,7 +328,7 @@
       chapters = [loaded]
       reading.chapterIndex = index
       reading.chapterPos = resolvedPos
-      document.title = reading.catalog[index]?.title ?? document.title
+      // 不写 document.title：标题会进入浏览器历史/标签页，泄露阅读内容。
       restoreScroll(loaded, resolvedPos, requestId)
       restoreScheduled = true
       return true
@@ -380,8 +381,8 @@
           const chapterIdx = Number(el.dataset.chapter)
           if (Number.isNaN(pos) || Number.isNaN(chapterIdx)) continue
           if (reading.chapterIndex !== chapterIdx) {
+            // 同上：章节标题不上 document.title
             reading.chapterIndex = chapterIdx
-            document.title = reading.catalog[chapterIdx]?.title ?? document.title
           }
           reading.chapterPos = pos
           void saveProgress(60_000)
@@ -1034,10 +1035,10 @@
           {#each chapter.paragraphs as p (p.endPos)}
             {#if p.img}
               <p data-chapter={chapter.index} data-pos={p.endPos} class="img-p">
-                <img
-                  src={api.epubImageUrl(reading.book?.bookUrl ?? '', p.img)}
+                <RemoteImage
                   alt=""
-                  loading="lazy"
+                  loadBlob={signal =>
+                    api.fetchEpubImage(reading.book?.bookUrl ?? '', p.img ?? '', signal)}
                 />
               </p>
             {:else if p.hr}
@@ -1447,7 +1448,8 @@
     text-align: center;
   }
 
-  .img-p img {
+  /* 图片元素在 RemoteImage 模板内拿不到本组件 scope hash，须用 :global 锚定 */
+  .img-p :global(img) {
     max-width: 100%;
     border-radius: var(--md-shape-sm);
   }

@@ -54,113 +54,183 @@ public static class SourceEndpoints
         MapDebugStub(app, "/bookSourceDebug");
         MapDebugStub(app, "/rssSourceDebug");
 
+        // 搜索 WebSocket。浏览器 JS 无法在 WS 握手时携带自定义 header，
+        // 故此路径豁免中间件强制认证（见 PasswordAuth.FirstMessageAuthPath），
+        // 改为校验首条消息内携带的密码；开放模式直接放行。
         app.Map("/searchBook", async (context) =>
         {
-            if (context.WebSockets.IsWebSocketRequest)
-            {
-                Console.WriteLine("[WebSocket] Incoming connection request...");
-                using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-                Console.WriteLine("[WebSocket] Connection accepted.");
-                var buffer = new byte[1024 * 4];
-
-                try
-                {
-                    while (webSocket.State == WebSocketState.Open)
-                    {
-                        using var ms = new MemoryStream();
-                        WebSocketReceiveResult receiveResult;
-                        try
-                        {
-                            do
-                            {
-                                receiveResult = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-                                ms.Write(buffer, 0, receiveResult.Count);
-                            } while (!receiveResult.EndOfMessage && !receiveResult.CloseStatus.HasValue);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[WebSocket] Receive error: {ex.Message}");
-                            break;
-                        }
-
-                        if (receiveResult.MessageType == WebSocketMessageType.Close || receiveResult.CloseStatus.HasValue)
-                        {
-                            Console.WriteLine("[WebSocket] Close message received.");
-                            break;
-                        }
-
-                        if (receiveResult.MessageType == WebSocketMessageType.Text)
-                        {
-                            var json = Encoding.UTF8.GetString(ms.ToArray());
-                            Console.WriteLine($"[WebSocket] Received: {json}");
-
-                            if (string.IsNullOrWhiteSpace(json)) continue;
-
-                            SearchRequest? searchRequest = null;
-                            try
-                            {
-                                searchRequest = JsonSerializer.Deserialize(json, AppJsonSerializerContext.Default.SearchRequest);
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[WebSocket] Deserialization error: {ex.Message}");
-                            }
-
-                            if (searchRequest != null && !string.IsNullOrWhiteSpace(searchRequest.Key))
-                            {
-                                Console.WriteLine($"[WebSocket] Searching for: {searchRequest.Key}");
-                                var localBooks = localService.GetLocalBooks();
-
-                                var searchResults = localBooks
-                                    .Where(b => b.Name.Contains(searchRequest.Key, StringComparison.OrdinalIgnoreCase) ||
-                                                b.Author.Contains(searchRequest.Key, StringComparison.OrdinalIgnoreCase))
-                                    .Select(b => new SearchBook(
-                                        Name: b.Name,
-                                        Author: b.Author,
-                                        BookUrl: b.BookUrl,
-                                        Origin: b.Origin,
-                                        OriginName: b.OriginName,
-                                        Type: b.Type,
-                                        TocUrl: b.TocUrl,
-                                        LatestChapterTitle: b.LatestChapterTitle
-                                    ))
-                                    .ToList();
-
-                                var responseJson = JsonSerializer.Serialize(searchResults, AppJsonSerializerContext.Default.ListSearchBook);
-                                var responseBytes = Encoding.UTF8.GetBytes(responseJson);
-                                await webSocket.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
-                                Console.WriteLine($"[WebSocket] Sent {searchResults.Count} results.");
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[WebSocket] Error: {ex}");
-                }
-                finally
-                {
-                    // 正常关闭（客户端主动断开或搜索结束）用 NormalClosure；
-                    // 之前误用 InternalServerError，前端会把正常断开当作错误提示。
-                    if (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseReceived)
-                    {
-                        try
-                        {
-                            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[WebSocket] Close error: {ex.Message}");
-                        }
-                    }
-                    Console.WriteLine("[WebSocket] Connection closed.");
-                }
-            }
-            else
+            if (!context.WebSockets.IsWebSocketRequest)
             {
                 Console.WriteLine("[WebSocket] Not a WebSocket request.");
                 context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+
+            Console.WriteLine("[WebSocket] Incoming connection request...");
+            using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+            Console.WriteLine("[WebSocket] Connection accepted.");
+            var buffer = new byte[1024 * 4];
+
+            try
+            {
+                // 未认证连接的首条消息限时到达，防止握手后被无限占用。
+                string? firstJson;
+                using (var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted))
+                {
+                    handshakeCts.CancelAfter(TimeSpan.FromSeconds(FirstMessageTimeoutSeconds));
+                    try
+                    {
+                        firstJson = await ReadMessageTextAsync(webSocket, buffer, handshakeCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+                    {
+                        Console.WriteLine("[WebSocket] First message timed out before authentication.");
+                        await CloseQuietlyAsync(webSocket, WebSocketCloseStatus.PolicyViolation, "认证超时");
+                        return;
+                    }
+                }
+
+                var first = DeserializeRequest(firstJson);
+                var authorized = PasswordAuth.IsOpenMode
+                    || PasswordAuth.IsRequestAuthorized(context)
+                    || (first is not null && PasswordAuth.TryValidate(first.Password ?? ""));
+                if (!authorized)
+                {
+                    // 与 HTTP 通道共用按 IP 的失败限流；超限后不再区分具体原因。
+                    if (!PasswordAuth.TryRegisterFailure(context, out _))
+                    {
+                        await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "认证失败次数过多，请稍后再试", CancellationToken.None);
+                        return;
+                    }
+                    await webSocket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "未授权：密码错误或缺失", CancellationToken.None);
+                    return;
+                }
+
+                if (first is not null && !string.IsNullOrWhiteSpace(first.Key))
+                {
+                    await SendSearchResultsAsync(webSocket, first, localService);
+                }
+
+                while (webSocket.State == WebSocketState.Open)
+                {
+                    var json = await ReadMessageTextAsync(webSocket, buffer, CancellationToken.None);
+                    if (json is null) break;
+
+                    var searchRequest = DeserializeRequest(json);
+                    if (searchRequest != null && !string.IsNullOrWhiteSpace(searchRequest.Key))
+                    {
+                        await SendSearchResultsAsync(webSocket, searchRequest, localService);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WebSocket] Error: {ex}");
+            }
+            finally
+            {
+                // 正常关闭（客户端主动断开或搜索结束）用 NormalClosure；
+                // 之前误用 InternalServerError，前端会把正常断开当作错误提示。
+                if (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseReceived)
+                {
+                    await CloseQuietlyAsync(webSocket, WebSocketCloseStatus.NormalClosure, "Closed");
+                }
+                Console.WriteLine("[WebSocket] Connection closed.");
             }
         });
+    }
+
+    /// <summary>未认证连接首条消息的等待上限，防止握手后被无限占用。</summary>
+    private const int FirstMessageTimeoutSeconds = 30;
+
+    /// <summary>
+    /// 读取一条完整 Text 消息并解码为字符串；对端关闭或接收出错返回 null。
+    /// 取消令牌触发时抛 OperationCanceledException，交由调用方区分认证超时与客户端断开。
+    /// </summary>
+    private static async Task<string?> ReadMessageTextAsync(
+        WebSocket webSocket, byte[] buffer, CancellationToken cancellationToken)
+    {
+        using var ms = new MemoryStream();
+        WebSocketReceiveResult receiveResult;
+        try
+        {
+            do
+            {
+                receiveResult = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                ms.Write(buffer, 0, receiveResult.Count);
+            } while (!receiveResult.EndOfMessage && !receiveResult.CloseStatus.HasValue);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WebSocket] Receive error: {ex.Message}");
+            return null;
+        }
+
+        if (receiveResult.MessageType == WebSocketMessageType.Close || receiveResult.CloseStatus.HasValue)
+        {
+            Console.WriteLine("[WebSocket] Close message received.");
+            return null;
+        }
+
+        if (receiveResult.MessageType != WebSocketMessageType.Text) return null;
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private static SearchRequest? DeserializeRequest(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize(json, AppJsonSerializerContext.Default.SearchRequest);
+        }
+        catch (Exception ex)
+        {
+            // 不打印原始报文：首条消息可能携带明文密码。
+            Console.WriteLine($"[WebSocket] Deserialization error: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static async Task SendSearchResultsAsync(
+        WebSocket webSocket, SearchRequest searchRequest, LocalBookService localService)
+    {
+        var localBooks = localService.GetLocalBooks();
+
+        var searchResults = localBooks
+            .Where(b => b.Name.Contains(searchRequest.Key, StringComparison.OrdinalIgnoreCase) ||
+                        b.Author.Contains(searchRequest.Key, StringComparison.OrdinalIgnoreCase))
+            .Select(b => new SearchBook(
+                Name: b.Name,
+                Author: b.Author,
+                BookUrl: b.BookUrl,
+                Origin: b.Origin,
+                OriginName: b.OriginName,
+                Type: b.Type,
+                TocUrl: b.TocUrl,
+                LatestChapterTitle: b.LatestChapterTitle
+            ))
+            .ToList();
+
+        var responseJson = JsonSerializer.Serialize(searchResults, AppJsonSerializerContext.Default.ListSearchBook);
+        var responseBytes = Encoding.UTF8.GetBytes(responseJson);
+        await webSocket.SendAsync(new ArraySegment<byte>(responseBytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        Console.WriteLine($"[WebSocket] Sent {searchResults.Count} results.");
+    }
+
+    private static async Task CloseQuietlyAsync(WebSocket webSocket, WebSocketCloseStatus status, string description)
+    {
+        try
+        {
+            await webSocket.CloseAsync(status, description, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WebSocket] Close error: {ex.Message}");
+        }
     }
 }

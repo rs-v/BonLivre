@@ -53,14 +53,15 @@ Local books use a `local://<filename>` URL. The fragment encodes chapter locatio
 
 Vite + Svelte 5 (runes) + TypeScript. No component library, no external router/store — plain CSS, a hash router in `src/lib/router.svelte.ts`, and rune-based shared state (`.svelte.ts` modules).
 
-- `src/lib/api.ts` — all backend calls via `fetch`. Base URL from `localStorage['remoteUrl']`, else `location.origin` (dev: same host, port 5000). Password from `localStorage['remotePassword']`: HTTP requests use `Authorization: Bearer`, while WebSocket/`<img src>`/sendBeacon append `?password=`. Field names must match the backend's camelCase records (`src/lib/types.ts`).
-- `src/lib/reader.svelte.ts` — reading session state (current book, catalog, chapterIndex/chapterPos) plus progress saving (sendBeacon, 60s throttle) and read-config load/save via `/getReadConfig`/`/saveReadConfig`.
+- `src/lib/api.ts` — all backend calls via `fetch`. Base URL from `localStorage['remoteUrl']`, else `location.origin` (dev: same host, port 5000). Password from `localStorage['remotePassword']`: always sent as `Authorization: Bearer`. Sensitive params (bookUrl, search keys) go in POST bodies — never in URLs; images/covers load via fetch+blob (`RemoteImage.svelte`), and the `/searchBook` WebSocket carries the password inside its first message. Field names must match the backend's camelCase records (`src/lib/types.ts`).
+- `src/lib/reader.svelte.ts` — reading session state (current book, catalog, chapterIndex/chapterPos) plus progress saving (keepalive fetch with auth header, 60s throttle) and read-config load/save via `/getReadConfig`/`/saveReadConfig`.
 - Views: `src/views/Bookshelf.svelte` (shelf grid, local filter + WS online search, connect dialog, upload, delete) and `src/views/Reader.svelte` (catalog drawer, content with EPUB image proxy, chapterPos tracking via IntersectionObserver, themes/font-size/width settings).
 - Routes (hash-based): `/` bookshelf, `/#/chapter` reader. There is no source-editor UI — the backend only stubs those endpoints anyway.
 - `chapterPos` semantics (compatible with legado web): cumulative character count of paragraphs read, +1 per paragraph for the newline.
+- Privacy convention: no `<title>` in `index.html` and never write `document.title`, so browser history reveals nothing about what was read. Keep it that way when adding views.
 
 ## Notes
 
 - The backend implements the subset of the legado API needed for local-file reading and stubs the rest (e.g. `saveBookSource` returns success without persisting, `getChapterList`/`getBookContent` return mock data for non-`local://` URLs). When wiring new frontend features, check whether the endpoint actually exists in `Endpoints/`.
-- No authentication exists on any endpoint and CORS is fully open — intended for local/trusted-network use.
+- Optional shared-password auth (`BONLIVRE_PASSWORD`, see `Configuration/PasswordAuth.cs`): Bearer header only — there is deliberately no `?password=` query channel because query strings leak into logs/history. CORS remains fully open; intended for local/trusted-network use.
 - `books/` (`.txt`) and `data/` (`bonlivre.db`) contents are gitignored. Changing from SQLite to LiteDB starts with fresh persisted data; legacy `.sqlite` files are not imported.

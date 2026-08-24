@@ -178,12 +178,12 @@ export const saveProgress = async (throttleMs = 0): Promise<boolean> => {
   }
 }
 
-/** 页面隐藏或卸载时使用 Beacon/keepalive 尽力刷新进度。 */
-export const flushProgress = (): boolean => {
+/** 页面隐藏或卸载时用 keepalive 请求尽力刷新进度；本地已先落盘，请求失败也不丢进度。 */
+export const flushProgress = (): void => {
   const progress = currentProgress()
-  if (!progress) return false
+  if (!progress) return
   persistProgressLocally(progress)
-  return api.saveBookProgressWithBeacon(progress)
+  api.saveProgressKeepalive(progress)
 }
 
 export const loadConfig = async () => {

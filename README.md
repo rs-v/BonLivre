@@ -146,11 +146,11 @@ When a password is set, all API and WebSocket requests require it. Static fronte
 
 How the credential is transmitted:
 - HTTP requests carry it via the `Authorization: Bearer <password>` header.
-- WebSocket, image (`<img src>`), and `sendBeacon` requests carry it via a `?password=` query parameter, since browsers cannot set custom headers on those.
+- The `/searchBook` WebSocket cannot send headers during the browser handshake; instead it authenticates the password sent inside the first message (`{"key": "...", "password": "..."}`). Images/covers are loaded with `fetch` + blob (headers included), never via credential-bearing URLs.
 
 ⚠️ **Security notes:**
 - Without HTTPS, the password is transmitted in plaintext. Use only on a trusted LAN, or put the backend behind HTTPS / an encrypted tunnel.
-- The query-parameter credential may appear in reverse-proxy or access logs.
+- Book URLs, search keywords, and other sensitive parameters travel in POST bodies — they never appear in URLs, so reverse-proxy/access logs and browser history reveal nothing about what is read. The page also sets no document title.
 - With `BONLIVRE_PASSWORD` set, the shared-password middleware protects every API and WebSocket endpoint, including upload/delete operations and local cover/image resources. Static frontend files, `/`, `/health`, and CORS preflight requests remain public.
 - Failed password attempts are limited per direct client IP: by default, 10 failures in 5 minutes return `401`; later failures return `429 Too Many Requests` with `Retry-After`. Valid credentials are never rate-limited. Customize this with `BONLIVRE_AUTH_FAILURE_LIMIT`, `BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`, and `BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS`.
 - The client address is taken from the direct TCP connection. Forwarded-IP headers are intentionally not trusted by default.
@@ -162,16 +162,16 @@ How the credential is transmitted:
 - `GET /getBookshelf` - Get all books in the bookshelf
 - `POST /saveBook` - Save a book to the bookshelf
 - `POST /deleteBook` - Move a local book to `books/.trash/`
-- `POST /uploadBook[?overwrite=true]` - Upload up to 10 local EPUB or TXT files per request
-- `GET /getChapterList?url={url}` - Get chapter list for a book
-- `GET /getBookContent?url={url}&index={index}` - Get content of a specific chapter
-- `GET /searchBookContent?url={url}&key={key}` - Search content within a local book
-- `GET /cover?path={path}` - Get book cover image
-- `GET /image?url={url}&path={path}` - Get images from EPUB files
+- `POST /uploadBook` - Upload up to 10 local EPUB or TXT files per request (multipart field `overwrite=true` overwrites existing files)
+- `POST /getChapterList` - Get chapter list for a book (`{"url": "local://..."}`)
+- `POST /getBookContent` - Get content of a specific chapter (`{"url": "local://...", "index": 0}`)
+- `POST /searchBookContent` - Search content within a local book (`{"url": "local://...", "key": "..."}`)
+- `POST /cover` - Get book cover image (`{"path": "local://..."}`); external http(s) covers are loaded by the frontend directly
+- `POST /image` - Get images from EPUB files (`{"url": "local://...", "path": "..."}`)
 - `GET /getReadConfig` - Get reading configuration
 - `POST /saveReadConfig` - Save reading configuration
 - `POST /saveBookProgress` - Save reading progress
-- `GET /getBookmarks?bookUrl={bookUrl}` - Get bookmarks for a book
+- `POST /getBookmarks` - Get bookmarks for a book (`{"bookUrl": "local://..."}`)
 - `POST /createBookmark` - Create a bookmark at the current reading position
 - `POST /deleteBookmark` - Delete a bookmark
 
@@ -405,12 +405,12 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 
 凭证传递方式：
 - HTTP 请求通过 `Authorization: Bearer <密码>` 请求头携带。
-- WebSocket、图片（`<img src>`）、`sendBeacon` 请求通过 `?password=` 查询参数携带，因为浏览器无法为这些请求设置自定义请求头。
+- `/searchBook` WebSocket 的浏览器握手无法携带自定义请求头，改为在首条消息内认证（`{"key": "...", "password": "..."}`）；封面/图片改用 fetch+blob 加载（凭证在请求头中），不再使用带凭证的 URL。
 
 ⚠️ **安全提示：**
 - 无 HTTPS 时密码为明文传输。请仅在可信局域网使用，或为后端套用 HTTPS / 加密隧道。
-- 查询参数中的密码可能出现在反向代理或访问日志中。
-- 不做登录失败限流或锁定。本功能面向局域网/个人使用，不适合公网暴露。
+- 书籍地址、搜索词等敏感参数一律走 POST body，不出现在 URL 中——反向代理/访问日志与浏览器历史不会泄露「在读什么」。页面也不设置 document 标题。
+- 设置密码后，共享密码中间件保护所有 API 与 WebSocket 端点。按直连客户端 IP 做失败限流：默认 5 分钟内失败 10 次返回 `401`，之后返回 `429 Too Many Requests` 并附 `Retry-After`。可用 `BONLIVRE_AUTH_FAILURE_LIMIT`、`BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`、`BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS` 自定义。
 
 ### 🔌 API 端点
 
@@ -418,16 +418,16 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 - `GET /getBookshelf` - 获取书架中的所有图书
 - `POST /saveBook` - 保存图书到书架
 - `POST /deleteBook` - 将本地图书移入 `books/.trash/`
-- `POST /uploadBook[?overwrite=true]` - 上传一个或多个本地 EPUB、TXT 文件
-- `GET /getChapterList?url={url}` - 获取图书的章节列表
-- `GET /getBookContent?url={url}&index={index}` - 获取特定章节的内容
-- `GET /searchBookContent?url={url}&key={key}` - 在本地图书中搜索全文
-- `GET /cover?path={path}` - 获取图书封面图片
-- `GET /image?url={url}&path={path}` - 从 EPUB 文件获取图片
+- `POST /uploadBook` - 上传一个或多个本地 EPUB、TXT 文件（表单字段 `overwrite=true` 覆盖同名文件）
+- `POST /getChapterList` - 获取图书的章节列表（`{"url": "local://..."}`）
+- `POST /getBookContent` - 获取特定章节的内容（`{"url": "local://...", "index": 0}`）
+- `POST /searchBookContent` - 在本地图书中搜索全文（`{"url": "local://...", "key": "..."}`）
+- `POST /cover` - 获取图书封面图片（`{"path": "local://..."}`）；外部 http(s) 封面由前端直连
+- `POST /image` - 从 EPUB 文件获取图片（`{"url": "local://...", "path": "..."}`）
 - `GET /getReadConfig` - 获取阅读配置
 - `POST /saveReadConfig` - 保存阅读配置
 - `POST /saveBookProgress` - 保存阅读进度
-- `GET /getBookmarks?bookUrl={bookUrl}` - 获取图书书签
+- `POST /getBookmarks` - 获取图书书签（`{"bookUrl": "local://..."}`）
 - `POST /createBookmark` - 在当前阅读位置创建书签
 - `POST /deleteBookmark` - 删除书签
 

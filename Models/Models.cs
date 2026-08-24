@@ -52,6 +52,19 @@ public record CreateBookmarkRequest(string BookUrl, int ChapterIndex, int Chapte
 
 public record DeleteBookmarkRequest(string BookUrl, long Id);
 
+// 敏感参数（书籍 URL、搜索词）一律走 POST body，避免出现在 URL 与访问日志中。
+public record GetBookmarksRequest(string BookUrl);
+
+public record ChapterListRequest(string Url);
+
+public record BookContentRequest(string Url, int Index);
+
+public record BookContentSearchRequest(string Url, string Key);
+
+public record CoverRequest(string Path);
+
+public record EpubImageRequest(string Url, string Path);
+
 public record BookChapter(
     string Title,
     string Url,
@@ -74,7 +87,8 @@ public record BookContentSearchResult(
 // API 响应包装类
 public record LeagdoApiResponse<T>(bool IsSuccess, string ErrorMsg, T Data);
 
-public record SearchRequest(string Key);
+// WebSocket 无法在握手时携带 Authorization header，密码随首条消息明文传入（见 /searchBook）。
+public record SearchRequest(string Key, string? Password = null);
 
 public record SearchBook(
     string Name,
