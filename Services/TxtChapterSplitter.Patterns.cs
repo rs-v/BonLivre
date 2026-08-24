@@ -9,8 +9,9 @@ namespace BonLivre.Services;
 internal static partial class TxtChapterSplitter
 {
     // 第X章/节/回/集/话/幕（普通章）与 第X卷/部/篇/册（分卷）。编号与单位间允许空格。
+    // 也允许一段区间（第1-4章）：num 取起点参与编号校验，end 为终点。
     [GeneratedRegex(
-        @"^(?<head>第[ \t　]*(?<num>[零〇○一二三四五六七八九十百千万萬亿億两兩廿卅卌壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９]{1,16})[ \t　]*(?<unit>[章节節回集话話幕卷部篇册冊]))",
+        @"^(?<head>第[\t　]*(?<num>[零〇○一二三四五六七八九十百千万萬亿億两兩廿卅卌壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９]{1,16})(?:[\t　]*[-–—－~～〜至到][\t　]*(?<end>[零〇○一二三四五六七八九十百千万萬亿億两兩廿卅卌壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９]{1,16}))?[\t　]*(?<unit>[章节節回集话話幕卷部篇册凊]))",
         RegexOptions.CultureInvariant)]
     private static partial Regex DiChapterRegex();
 
@@ -39,8 +40,9 @@ internal static partial class TxtChapterSplitter
     private static partial Regex WordRegex();
 
     // （一）/ (1) / [一] / 〔2〕 / 【3】 等括号编号。
+    // 含区间写法 (1-4)、（一至三）：num 取起点。
     [GeneratedRegex(
-        @"^(?<head>[\(（\[［〔〖【][ \t　]*(?<num>[零〇○一二三四五六七八九十百千万两0-9０-９]{1,8})[ \t　]*[\)）\]］〕〗】])",
+        @"^(?<head>[\(（\[［〔〖【][\t　]*(?<num>[零〇○一二三四五六七八九十百千万两0-9０-９]{1,8})(?:[\t　]*[-–—－~～〜至到][\t　]*(?<end>[零〇○一二三四五六七八九十百千万两0-9０-９]{1,8}))?[\t　]*[\)）\]］〕〗】])",
         RegexOptions.CultureInvariant)]
     private static partial Regex BracketRegex();
 

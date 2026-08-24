@@ -75,7 +75,9 @@ internal static partial class TxtChapterSplitter
             if (hits[i].Number < 0 || hits[i + 1].Number < 0) continue;
             pairs++;
             if (hits[i + 1].Number > hits[i].Number) ascending++;
-            if (hits[i + 1].Number == hits[i].Number + 1) consecutive++;
+            // 区间标题按终点衔接：(1-4) 之后 (5-8) 算 +1 连号。
+            var prevEnd = hits[i].RangeEnd >= 0 ? hits[i].RangeEnd : hits[i].Number;
+            if (hits[i + 1].Number == prevEnd + 1) consecutive++;
         }
         if (pairs == 0) return false;
 

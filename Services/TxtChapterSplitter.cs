@@ -85,7 +85,9 @@ internal static partial class TxtChapterSplitter
     private static int Strength(Family f) => IsStrong(f) ? 2 : IsWeak(f) ? 1 : 0;
 
     private readonly record struct Candidate(
-        int LineStart, string Title, Family Family, long Number, bool IsVolume);
+        int LineStart, string Title, Family Family, long Number, bool IsVolume,
+        /// <summary>区间标题（第1-4章）的终止编号；非区间候选为 -1。</summary>
+        long RangeEnd = -1);
 
     /// <summary>
     /// 把 TXT 全文按章节标题切分为若干区间（char 口径）。
@@ -188,7 +190,7 @@ internal static partial class TxtChapterSplitter
             var unit = m.Groups["unit"].Value[0];
             var isVolume = unit is '卷' or '部' or '篇' or '册' or '冊';
             candidate = Make(line, m, isVolume ? Family.DiVolume : Family.DiChapter,
-                ParseNumber(m.Groups["num"].ValueSpan), isVolume);
+                ParseNumber(m.Groups["num"].ValueSpan), isVolume, RangeEndOf(m));
             return true;
         }
 
@@ -231,7 +233,8 @@ internal static partial class TxtChapterSplitter
             m = BracketRegex().Match(line);
             if (m.Success)
             {
-                candidate = Make(line, m, Family.Bracket, ParseNumber(m.Groups["num"].ValueSpan), false);
+                candidate = Make(line, m, Family.Bracket, ParseNumber(m.Groups["num"].ValueSpan),
+                    false, RangeEndOf(m));
                 return true;
             }
 
@@ -286,8 +289,18 @@ internal static partial class TxtChapterSplitter
         return line.Length <= MaxHeadingLine;
     }
 
-    private static Candidate Make(string line, Match m, Family family, long number, bool isVolume) =>
-        new(0, MakeTitle(line, m.Groups["head"].Index + m.Groups["head"].Length), family, number, isVolume);
+    private static Candidate Make(string line, Match m, Family family, long number, bool isVolume, long rangeEnd = -1)
+    {
+        var headLength = m.Groups["head"].Index + m.Groups["head"].Length;
+        return new(0, MakeTitle(line, headLength), family, number, isVolume, rangeEnd);
+    }
+
+    /// <summary>取匹配里的 end 组（区间终点），无则 -1。</summary>
+    private static long RangeEndOf(Match m)
+    {
+        var e = m.Groups["end"];
+        return e.Success ? ParseNumber(e.ValueSpan) : -1;
+    }
 
     private static readonly char[] SentencePunctuation = ['，', '。', '！', '？', '；', ',', '.', '!', '?', ';'];
 
