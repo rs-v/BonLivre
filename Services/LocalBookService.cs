@@ -5,6 +5,7 @@ using System.Linq;
 using HtmlAgilityPack;
 using VersOne.Epub;
 using BonLivre.Models;
+using static BonLivre.Services.ReaderTextMetrics;
 
 namespace BonLivre.Services;
 
@@ -232,6 +233,40 @@ public partial class LocalBookService
             offsets[i] = bytePos;
         }
         return offsets;
+    }
+
+    /// <summary>
+    /// 调用 <see cref="TxtChapterSplitter.Split"/> 得到 char 口径的章节区间，
+    /// 再一次线性重放解码把每个区间的起止 char 索引翻译成文件内的绝对字节偏移。
+    ///
+    /// 切分本身在解码后的整本 string 上做（启发式需全文扫描），但本方法返回后整本 string
+    /// 即由调用方丢弃：缓存里只留字节区间，读章正文时按字节范围 seek 流式解码。
+    /// </summary>
+    private static List<TxtChapterSpan> BuildTxtChaptersWithByteOffsets(
+        string content, byte[] bytes, Encoding encoding, int bomLength)
+    {
+        var charSpans = TxtChapterSplitter.Split(content);
+        if (charSpans.Count == 0) return charSpans;
+
+        // 收集每章的起止 char 索引，一次线性重放解码把它们全部翻译成字节偏移。
+        // Split 保证区间按 Start 升序、互不重叠且覆盖全文，故这个列表天然非递减，
+        // 满足 MapCharIndicesToByteOffsets 对升序的要求。
+        var indices = new List<int>(charSpans.Count * 2);
+        foreach (var s in charSpans)
+        {
+            indices.Add((int)s.Start);
+            indices.Add((int)(s.Start + s.Length));
+        }
+        var offsets = MapCharIndicesToByteOffsets(bytes, bomLength, encoding, indices);
+
+        var result = new List<TxtChapterSpan>(charSpans.Count);
+        for (var i = 0; i < charSpans.Count; i++)
+        {
+            var byteStart = offsets[i * 2];
+            var byteEnd = offsets[i * 2 + 1];
+            result.Add(charSpans[i] with { Start = byteStart, Length = byteEnd - byteStart });
+        }
+        return result;
     }
 
     /// <summary>
@@ -752,18 +787,6 @@ public partial class LocalBookService
         }
     }
 
-    // 行内格式标签 -> 不破坏段落切分的占位标记。阅读器据此把段内片段包成 <em>/<strong>，
-    // 块级语义（blockquote/li）同理标记后还原。用成对 U+E000 区私有字符，不会出现在正文中，
-    // 也不在 JSON/HTML 需转义的范围内。
-    private const char InlineEmStart = '';
-    private const char InlineEmEnd = '';
-    private const char InlineStrongStart = '';
-    private const char InlineStrongEnd = '';
-    private const char BlockQuoteStart = '';
-    private const char BlockQuoteEnd = '';
-    private const char ListItemStart = '';
-    private const char ListItemEnd = '';
-
     private string ExtractEpubChapterText(string? htmlContent, string filePath)
     {
         if (string.IsNullOrEmpty(htmlContent)) return "";
@@ -830,377 +853,9 @@ public partial class LocalBookService
         return $"{(start > 0 ? "…" : "")}{snippet}{(end < line.Length ? "…" : "")}";
     }
 
-    /// <summary>剥离私有占位标记（内联强调 + 块级语义），供搜索快照等只读纯文本场景使用。</summary>
-    private static readonly char[] PrivateMarkers =
-    [
-        InlineEmStart, InlineEmEnd, InlineStrongStart, InlineStrongEnd,
-        BlockQuoteStart, BlockQuoteEnd, ListItemStart, ListItemEnd,
-    ];
-
-    private static string StripInlineMarkers(string s)
-    {
-        if (s.IndexOfAny(PrivateMarkers) < 0) return s;
-        var sb = new StringBuilder(s.Length);
-        foreach (var ch in s)
-        {
-            if (IsPrivateMarker(ch)) continue;
-            sb.Append(ch);
-        }
-        return sb.ToString();
-    }
-
-    private static bool IsPrivateMarker(char ch) =>
-        ch is InlineEmStart or InlineEmEnd or InlineStrongStart or InlineStrongEnd
-            or BlockQuoteStart or BlockQuoteEnd or ListItemStart or ListItemEnd;
-
-    /// <summary>
-    /// TXT 章节切分结果：标题、原文区间（字节偏移与字节长度）、分卷标记，
-    /// 以及与阅读进度同口径的正文长度（char 计数，在切分时一次性算好，读章时不再重算）。
-    /// Start/Length 是文件内的**绝对字节偏移**（已含 BOM），可直接用于 seek。
-    /// </summary>
-    private readonly record struct TxtChapterSpan(
-        string Title,
-        long Start,
-        long Length,
-        bool IsVolume,
-        int ContentLength);
-
-    // 章节标题正则（逐行匹配）。只接受完整物理行，避免正文中提及章节时误切分。
-    // 支持常见中英文编号、卷目、特殊章节名、全角字符、标题包装和 CRLF。
-    //
-    // 相比初版扩展的命名形式：
-    //  - 中文数字 / 阿拉伯数字 + 顿号或点起首（一、标题 / 1. 标题）；
-    //  - 阿拉伯数字 + 空格或 ｜/| 分隔符（1 标题 / 1｜标题），点后紧跟数字则不切（3.14 不算）；
-    //  - 括号包裹编号：（一）/ (1) / [一] / 〔二〕 等全角/半角形式；
-    //  - 装饰符号起首（☆★◆◇▲▼■●○ 等）+ 1~30 字；
-    //  - ◎xxx◎、=== xxx ===、【xxx】、〖xxx〗 等包装；
-    //  - 元信息短词（简介/文案/内容提要/作者的话/导读）；
-    //  - 番外编号：番一 / 番1。
-    // 防误切：纯阿拉伯数字行必须后接「分隔符 + 标题文字」或「行尾」，避免「1980年」「3个人」被当章节；
-    // 阿拉伯数字 + 点后紧跟数字不切（3.14、版本号 1.2.3）。
-    // 元信息短词（序章/楔子/正文/简介…）后缀收紧为必须分隔符（空白或 :：、. 等）才追加文字，
-    // 避免「正文内容」「正文1」这类正文行被短词误吞为标题。
-    [GeneratedRegex(
-        @"^[ \t　]*(?:【|［|〔|\[|〖|◎|===)?[ \t　]*(?<title>(?:第[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}[ \t　]*(?:(?<volumeUnit>[卷部篇册])|[章节回集话幕])(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|(?<volumePrefix>[卷部篇册])[ \t　]*[零〇○一二三四五六七八九十百千万萬亿億两兩壹贰貳叁參肆伍陆陸柒捌玖拾佰仟0-9０-９IVXLCDM]{1,16}(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|(?:完本感言|作品相关|大结局|Introduction|Prologue|Epilogue|Preface|Afterword|Appendix|序章|序言|序幕|楔子|前言|引子|导言|引言|正文|后记|后序|尾声|终章|结语|番外|外传|附录|跋|简介|文案|内容提要|内容简介|作者的话|导读)(?:(?:[ \t　]+|[:：、.．·\-—–]+)[ \t　]*[^\r\n】\]］〕〗◎]{0,80})?|(?<englishVolume>Book|Part|Volume)[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|Chapter[ \t　]+(?:[0-9０-９]{1,5}|[IVXLCDM]{1,12}|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|Eleven|Twelve|Thirteen|Fourteen|Fifteen|Sixteen|Seventeen|Eighteen|Nineteen|Twenty|First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth|Sixteenth|Seventeenth|Eighteenth|Nineteenth|Twentieth)(?:[ \t　]*(?:[:：、.．·\-—–][ \t　]*)?[^\r\n】\]］〕〗◎]{0,80})?|[零〇○一二三四五六七八九十百千万]{1,8}[、．.](?:[ \t　]*[^\r\n]{1,80})?|0*[1-9][0-9]{0,4}[．.](?![0-9０-９])[^\r\n]{0,80}|0*[1-9][0-9]{0,4}(?:[ \t　]+[^\r\n\d｜|]{1,80}|\s*[｜|][^\r\n]{1,80})|[\(（\[［〔〖]\s*(?:[零〇○一二三四五六七八九十百千万]{1,8}|0*[1-9][0-9]{0,4})\s*[\)）\]］〕〗](?:[ \t　]*[^\r\n]{0,80})?|[☆★✦✧✩✪✫✬✭✮✡✯✰◆◇▲△▼▽■□●○♠♣♥♦※][^\r\n]{1,30}|番[ \t　]*(?:[零〇○一二三四五六七八九十百千万]{1,8}|0*[1-9][0-9]{0,4})(?:[ \t　]*[^\r\n]{0,80})?))[ \t　]*(?:】|］|〕|〗|\]|◎)?[ \t　]*(?=\r?$)",
-        RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex ChapterHeadingRegex();
-
-    /// <summary>
-    /// 将 TXT 全文按章节标题切分为若干区间。目录、正文、搜索和全书进度共用这些区间。
-    /// 无标题命中时整篇作为单章「正文」；首个标题前的非空内容保留为「前言」。
-    ///
-    /// 启发式后处理（在 ChapterHeadingRegex 基础命中之上）：
-    ///  1. 分隔符边界：当编号类命中稀少时，用水平分隔线（===== / ------- 等）补章；
-    ///  2. 模式一致性 + 回填：取出现次数最多的编号模式，回填符合该模式的漏判短行；
-    ///  3. 空章合并：非卷空区间（两个普通标题紧邻、中间无正文）删除，避免目录出现点进去只有标题的项。
-    ///
-    /// 切分在解码后的整本 string 上做（char 索引），返回前把每个 Span 的 char 偏移翻译成文件字节偏移
-    /// ——Span 的 Start/Length 最终是字节口径，读章正文时按字节范围 seek 流式解码。
-    /// 整本 string 在本方法返回后即由调用方丢弃，不再常驻。
-    /// </summary>
-    private static List<TxtChapterSpan> BuildTxtChaptersWithByteOffsets(
-        string content, byte[] bytes, Encoding encoding, int bomLength)
-    {
-        var charSpans = BuildTxtChapters(content);
-        if (charSpans.Count == 0) return charSpans;
-
-        // 收集每章的起止 char 索引，一次线性重放解码把它们全部翻译成字节偏移。
-        // Spans 已在 BuildTxtChapters 末尾按 Start 升序产出且互不重叠，故这个列表天然非递减，
-        // 满足 MapCharIndicesToByteOffsets 对升序的要求。
-        var indices = new List<int>(charSpans.Count * 2);
-        foreach (var s in charSpans)
-        {
-            indices.Add((int)s.Start);
-            indices.Add((int)(s.Start + s.Length));
-        }
-        var offsets = MapCharIndicesToByteOffsets(bytes, bomLength, encoding, indices);
-
-        var result = new List<TxtChapterSpan>(charSpans.Count);
-        for (var i = 0; i < charSpans.Count; i++)
-        {
-            var byteStart = offsets[i * 2];
-            var byteEnd = offsets[i * 2 + 1];
-            result.Add(charSpans[i] with { Start = byteStart, Length = byteEnd - byteStart });
-        }
-        return result;
-    }
-
-    private static List<TxtChapterSpan> BuildTxtChapters(string content)
-    {
-        var matches = ChapterHeadingRegex().Matches(content);
-        var hits = new List<TxtHeadingHit>(matches.Count);
-        var hitSet = new HashSet<int>();
-        for (int i = 0; i < matches.Count; i++)
-        {
-            var title = matches[i].Groups["title"].Value.Trim();
-            bool isVolume = matches[i].Groups["volumeUnit"].Success ||
-                matches[i].Groups["volumePrefix"].Success ||
-                matches[i].Groups["englishVolume"].Success;
-            hits.Add(new TxtHeadingHit(matches[i].Index, title, isVolume));
-            hitSet.Add(matches[i].Index);
-        }
-
-        // 统计带编号的命中，判定主模式（用于回填漏判短行）。
-        // 只对「带编号且非第X章」的模式回填：第X章/Book/Chapter 已由原正则充分覆盖，
-        // 短词（序章/正文…）易误切，不作为回填主模式。
-        var buckets = new Dictionary<string, int>();
-        int numberedHits = 0;
-        foreach (var h in hits)
-        {
-            if (!TxtHeadingHasNumber(h.Title)) continue;
-            numberedHits++;
-            var tag = TxtHeadingPatternTag(h.Title);
-            if (tag == "di" || tag == "word") continue;
-            buckets[tag] = (buckets.TryGetValue(tag, out var c) ? c : 0) + 1;
-        }
-        string mainTag = "other";
-        int mainCount = 0;
-        foreach (var kv in buckets)
-        {
-            if (kv.Value > mainCount) { mainCount = kv.Value; mainTag = kv.Key; }
-        }
-
-        // 1. 分隔符补全：编号类命中 < 3 时启用，避免与编号标题打架。
-        if (numberedHits < 3)
-        {
-            int pos = 0;
-            while (pos < content.Length)
-            {
-                int nl = content.IndexOf('\n', pos);
-                int lineEnd = nl < 0 ? content.Length : nl;
-                var line = content.AsSpan(pos, lineEnd - pos);
-                if (IsSeparatorLine(line) && !hitSet.Contains(pos))
-                {
-                    var title = NextNonEmptyLineTitle(content, nl < 0 ? content.Length : nl + 1, "分隔线");
-                    hits.Add(new TxtHeadingHit(pos, title, false));
-                    hitSet.Add(pos);
-                }
-                if (nl < 0) break;
-                pos = nl + 1;
-            }
-        }
-
-        // 2. 模式回填：主模式 ≥ 5 时，回填符合主模式形态的未命中短行。
-        if (mainCount >= 5)
-        {
-            int pos = 0;
-            while (pos < content.Length)
-            {
-                if (!hitSet.Contains(pos))
-                {
-                    int nl = content.IndexOf('\n', pos);
-                    int lineEnd = nl < 0 ? content.Length : nl;
-                    var t = content.AsSpan(pos, lineEnd - pos).Trim();
-                    if (t.Length >= 2 && t.Length <= 30 && TxtHeadingMatchesPattern(t.ToString(), mainTag))
-                    {
-                        hits.Add(new TxtHeadingHit(pos, t.ToString(), false));
-                        hitSet.Add(pos);
-                    }
-                }
-                int next = content.IndexOf('\n', pos);
-                if (next < 0) break;
-                pos = next + 1;
-            }
-        }
-
-        hits.Sort((a, b) => a.Index.CompareTo(b.Index));
-
-        if (hits.Count == 0)
-        {
-            return new List<TxtChapterSpan>
-            {
-                new("正文", 0, content.Length, false, CalculateContentLength(content.AsSpan())),
-            };
-        }
-
-        var spans = new List<TxtChapterSpan>();
-
-        // 首个标题之前的正文（序言/前言等），非空则保留为一章。
-        int firstStart = hits[0].Index;
-        if (content.AsSpan(0, firstStart).Trim().Length > 0)
-        {
-            spans.Add(new TxtChapterSpan(
-                "前言",
-                0,
-                firstStart,
-                false,
-                CalculateContentLength(content.AsSpan(0, firstStart))));
-        }
-
-        // 3. 生成区间，并把空区间标记为 ContentLength=0。
-        for (int i = 0; i < hits.Count; i++)
-        {
-            int start = hits[i].Index;
-            int end = (i + 1 < hits.Count) ? hits[i + 1].Index : content.Length;
-            var body = content.AsSpan(start, end - start);
-            var contentLength = CalculateContentLength(body);
-            bool hasBody = contentLength > hits[i].Title.Length + 1;
-            spans.Add(new TxtChapterSpan(
-                hits[i].Title,
-                start,
-                end - start,
-                hits[i].IsVolume,
-                hasBody ? contentLength : 0));
-        }
-
-        // 4. 空章合并：非卷空区间删除。卷标题空区间保留（前端按 IsVolume 折叠/样式区分，
-        //    seekMap 会跳过 length<=0 的章节）。
-        for (int i = 0; i < spans.Count;)
-        {
-            if (!spans[i].IsVolume && spans[i].ContentLength == 0)
-            {
-                spans.RemoveAt(i);
-            }
-            else
-            {
-                i++;
-            }
-        }
-
-        return spans.Count > 0
-            ? spans
-            : new List<TxtChapterSpan>
-            {
-                new("正文", 0, content.Length, false, CalculateContentLength(content.AsSpan())),
-            };
-    }
-
-    // 水平分隔线字符集（半角与全角形式）。
-    private const string SeparatorChars = "=*~-_─═▔·•＝＊～＿－";
-
-    /// <summary>
-    /// 判定一行是否为「水平分隔线」：trim 后非空白字符 ≥3，其中分隔符占比 ≥50%，
-    /// 且首尾非空白字符都是分隔符。覆盖 ===== / ------- / === 标题 === / · · · 等形态，
-    /// 同时排除「正文---」「3.14」这类混杂行。
-    /// </summary>
-    private static bool IsSeparatorLine(ReadOnlySpan<char> line)
-    {
-        var t = line.Trim();
-        if (t.Length < 3) return false;
-        int sep = 0, nonws = 0;
-        char first = '\0', last = '\0';
-        for (int i = 0; i < t.Length; i++)
-        {
-            var ch = t[i];
-            if (ch == ' ' || ch == '\t' || ch == '　') continue;
-            nonws++;
-            if (SeparatorChars.Contains(ch)) sep++;
-            if (first == '\0') first = ch;
-            last = ch;
-        }
-        if (nonws < 3) return false;
-        if (sep * 100 < nonws * 50) return false;
-        if (sep < 3) return false;
-        return SeparatorChars.Contains(first) && SeparatorChars.Contains(last);
-    }
-
-    /// <summary>取从 startAt 开始的第一个非空行（trim 后），截断为 ≤40 字作章节标题；无则回退 fallback。</summary>
-    private static string NextNonEmptyLineTitle(string content, int startAt, string fallback)
-    {
-        int pos = startAt;
-        while (pos < content.Length)
-        {
-            int nl = content.IndexOf('\n', pos);
-            int lineEnd = nl < 0 ? content.Length : nl;
-            var t = content.AsSpan(pos, lineEnd - pos).Trim();
-            if (!t.IsEmpty)
-            {
-                return t.Slice(0, Math.Min(40, t.Length)).ToString();
-            }
-            if (nl < 0) break;
-            pos = nl + 1;
-        }
-        return fallback;
-    }
-
-    /// <summary>章节命中临时记录：标题、原文起始位置、是否卷标题。</summary>
-    private readonly record struct TxtHeadingHit(int Index, string Title, bool IsVolume);
-
-    /// <summary>标题是否带编号（用于主模式统计与分隔符启用判定，排除短词误切）。</summary>
-    [GeneratedRegex(
-        @"^(第[零〇○一二三四五六七八九十百千万萬0-9]|番[零〇○一二三四五六七八九十百千万0-9]|[0-9]{1,5}[．. ]|[零〇○一二三四五六七八九十百千万]{1,8}[、．.])",
-        RegexOptions.CultureInvariant)]
-    private static partial Regex NumberedHeadingRegex();
-
-    private static bool TxtHeadingHasNumber(string title)
-        => NumberedHeadingRegex().IsMatch(title.TrimStart());
-
-    /// <summary>给已命中标题分桶：di(第X章)/fan(番X)/brk(括号)/cnpunct(中文+点)/ardot(阿+点)/arspace(阿+空格)/word(短词)。</summary>
-    private static string TxtHeadingPatternTag(string title)
-    {
-        var t = title.TrimStart();
-        if (t.StartsWith('第')) return "di";
-        if (t.StartsWith('番')) return "fan";
-        if (t.Length > 0 && "（([［〔〖".Contains(t[0])) return "brk";
-        if (ChineseNumPunctRegex().IsMatch(t)) return "cnpunct";
-        if (ArabicDotRegex().IsMatch(t)) return "ardot";
-        if (ArabicSpaceRegex().IsMatch(t)) return "arspace";
-        return "word";
-    }
-
-    /// <summary>未命中短行是否符合主模式形态（用于回填）。</summary>
-    private static bool TxtHeadingMatchesPattern(string line, string mainTag) => mainTag switch
-    {
-        "ardot" => ArabicDotRegex().IsMatch(line),
-        "arspace" => ArabicSpaceRegex().IsMatch(line),
-        "cnpunct" => ChineseNumPunctRegex().IsMatch(line),
-        "brk" => BracketNumberRegex().IsMatch(line),
-        "fan" => FanNumberRegex().IsMatch(line),
-        _ => false,
-    };
-
-    [GeneratedRegex(@"^[零〇○一二三四五六七八九十百千万]{1,8}[、．.]", RegexOptions.CultureInvariant)]
-    private static partial Regex ChineseNumPunctRegex();
-
-    [GeneratedRegex(@"^[0-9]{1,5}[．.](?![0-9０-９])", RegexOptions.CultureInvariant)]
-    private static partial Regex ArabicDotRegex();
-
-    [GeneratedRegex(@"^[0-9]{1,5}[ \t　]", RegexOptions.CultureInvariant)]
-    private static partial Regex ArabicSpaceRegex();
-
-    [GeneratedRegex(@"^[\(（\[［〔〖]\s*[零〇○一二三四五六七八九十百千万0-9]{1,8}\s*[\)）\]］〕〗]", RegexOptions.CultureInvariant)]
-    private static partial Regex BracketNumberRegex();
-
-    [GeneratedRegex(@"^番\s*[零〇○一二三四五六七八九十百千万0-9]{1,8}", RegexOptions.CultureInvariant)]
-    private static partial Regex FanNumberRegex();
-
-    /// <summary>按阅读器的段落规则计算章内进度范围：trim、忽略空行，每段长度加一。
-    /// 图片行 / &lt;hr&gt; 也计入（与 Reader.svelte splitContent 一致），否则 seekMap
-    /// 与搜索定位会相对章末偏移。</summary>
-    private static int CalculateContentLength(ReadOnlySpan<char> content)
-    {
-        var total = 0;
-        while (true)
-        {
-            int newline = content.IndexOf('\n');
-            var line = (newline >= 0 ? content[..newline] : content).Trim();
-            // 与前端 visibleLength 一致：剥离私有占位标记后的可见字数 +1（换行）。
-            // 图片 / hr 标记行本身也是段落（有 endPos），必须计入。
-            if (!line.IsEmpty)
-            {
-                total = checked(total + CountVisibleChars(line) + 1);
-            }
-
-            if (newline < 0) return total;
-            content = content[(newline + 1)..];
-        }
-    }
-
     /// <summary>是否为阅读器专用的非文本标记行（图片占位、水平分隔线）。</summary>
     private static bool IsMarkerLine(ReadOnlySpan<char> line) =>
         IsImageMarker(line.ToString()) || line.SequenceEqual("<hr>");
-
-    /// <summary>统计阅读器可见的字符数：剔除私有占位标记（内联强调 + 块级语义）。</summary>
-    private static int CountVisibleChars(ReadOnlySpan<char> line)
-    {
-        var count = 0;
-        foreach (var ch in line)
-        {
-            if (IsPrivateMarker(ch)) continue;
-            count++;
-        }
-        return count;
-    }
 
     // 块级元素：遇到这些标签前后插入换行，保证段落切分正确。
     private static readonly HashSet<string> BlockElements = new(StringComparer.OrdinalIgnoreCase)
