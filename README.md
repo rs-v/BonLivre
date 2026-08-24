@@ -177,7 +177,7 @@ How the credential is transmitted:
 
 #### Source Compatibility Endpoints
 - `GET /getBookSources` and `POST /saveBookSource` - Compatibility stubs; remote-source management is not implemented
-- `WS /searchBook` - Search locally available book titles and authors over WebSocket
+- `WS /searchBook` - Search locally available book titles and authors over WebSocket. The server streams the full result set (possibly empty) and then closes the connection, which the client treats as the "search finished" signal.
 
 ### 🔧 Development
 
@@ -407,10 +407,22 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 - HTTP 请求通过 `Authorization: Bearer <密码>` 请求头携带。
 - `/searchBook` WebSocket 的浏览器握手无法携带自定义请求头，改为在首条消息内认证（`{"key": "...", "password": "..."}`）；封面/图片改用 fetch+blob 加载（凭证在请求头中），不再使用带凭证的 URL。
 
+密码比较采用常量时间算法，防时序侧信道。
+
 ⚠️ **安全提示：**
 - 无 HTTPS 时密码为明文传输。请仅在可信局域网使用，或为后端套用 HTTPS / 加密隧道。
+- 查询参数中的密码可能出现在反向代理或访问日志中。
+
 - 书籍地址、搜索词等敏感参数一律走 POST body，不出现在 URL 中——反向代理/访问日志与浏览器历史不会泄露「在读什么」。页面也不设置 document 标题。
-- 设置密码后，共享密码中间件保护所有 API 与 WebSocket 端点。按直连客户端 IP 做失败限流：默认 5 分钟内失败 10 次返回 `401`，之后返回 `429 Too Many Requests` 并附 `Retry-After`。可用 `BONLIVRE_AUTH_FAILURE_LIMIT`、`BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`、`BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS` 自定义。
+
+- 设置 `BONLIVRE_PASSWORD` 后，共享密码中间件会保护所有 API 与 WebSocket 端点，包括上传/删除操作及本地封面/图片资源。静态前端文件、`/`、`/health` 与 CORS 预检请求保持公开。
+
+- 失败的密码尝试按直连客户端 IP 限流：默认 5 分钟内 10 次失败返回 `401`，超出后返回 `429 Too Many Requests` 并附带 `Retry-After`。正确的凭证永不被限流。可通过 `BONLIVRE_AUTH_FAILURE_LIMIT`、`BONLIVRE_AUTH_FAILURE_WINDOW_SECONDS`、`BONLIVRE_AUTH_FAILURE_MAX_TRACKED_CLIENTS` 自定义。
+
+- 客户端地址取自直连 TCP 连接。默认有意不信任转发 IP 头。
+
+- 未设置 `BONLIVRE_PASSWORD` 时仍为开放模式，所有 API 端点均公开。此为局域网/个人使用设计，不适合公网暴露。
+
 
 ### 🔌 API 端点
 
@@ -419,6 +431,7 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 - `POST /saveBook` - 保存图书到书架
 - `POST /deleteBook` - 将本地图书移入 `books/.trash/`
 - `POST /uploadBook` - 上传一个或多个本地 EPUB、TXT 文件（表单字段 `overwrite=true` 覆盖同名文件）
+- `POST /downloadBook` - 下载整本原始文件（`{"url": "local://..."}`），文件名经 Content-Disposition 下发
 - `POST /getChapterList` - 获取图书的章节列表（`{"url": "local://..."}`）
 - `POST /getBookContent` - 获取特定章节的内容（`{"url": "local://...", "index": 0}`）
 - `POST /searchBookContent` - 在本地图书中搜索全文（`{"url": "local://...", "key": "..."}`）
@@ -433,7 +446,7 @@ $env:BONLIVRE_PASSWORD="你的密码"; dotnet run
 
 #### 书源兼容端点
 - `GET /getBookSources`、`POST /saveBookSource` - 兼容性存根；尚未实现远程书源管理
-- `WS /searchBook` - 通过 WebSocket 搜索本地已有图书的书名和作者
+- `WS /searchBook` - 通过 WebSocket 搜索本地已有图书的书名和作者。服务端会流式发出完整结果集（可能为空）后关闭连接，客户端以此作为「搜索完成」信号。
 
 ### 🔧 开发
 

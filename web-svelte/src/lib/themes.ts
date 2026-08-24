@@ -21,7 +21,7 @@ export const themeAt = (index: number): ReaderTheme =>
 
 export const NIGHT_THEME_INDEX = 6
 
-/** 预置字体：family 为字体栈，stylesheet 为网络字体样式表（fontsource CDN，unicode-range 分片按需下载） */
+/** 预置字体：family 为字体栈，stylesheet 为网络字体样式表（unicode-range 分片按需下载） */
 export type WebFont = {
   name: string
   family: string
@@ -43,7 +43,9 @@ export const fonts: WebFont[] = [
   {
     name: '楷书',
     family: '"LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", "楷体", serif',
-    stylesheet: 'https://cdn.jsdelivr.net/npm/@fontsource/lxgw-wenkai@5/300.css',
+    // fontsource 的 lxgw-wenkai 只发布 latin 子集（无中文），改用作者发布的
+    // lxgw-wenkai-webfont：同样的 'LXGW WenKai' family、300 weight，但带完整 CJK 分片。
+    stylesheet: 'https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1/lxgwwenkai-light.css',
   },
 ]
 
