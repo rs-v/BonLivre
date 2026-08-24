@@ -17,6 +17,7 @@ namespace BonLivre.Configuration;
 [JsonSerializable(typeof(BookContentSearchRequest))]
 [JsonSerializable(typeof(CoverRequest))]
 [JsonSerializable(typeof(EpubImageRequest))]
+[JsonSerializable(typeof(DownloadBookRequest))]
 [JsonSerializable(typeof(BookChapter))]
 [JsonSerializable(typeof(BookContentSearchResult))]
 [JsonSerializable(typeof(SearchRequest))]

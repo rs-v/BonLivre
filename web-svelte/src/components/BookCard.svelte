@@ -7,12 +7,14 @@
     book,
     onclick,
     ondelete,
+    ondownload,
     selected = false,
     selecting = false,
   }: {
     book: Book | SearchBook
     onclick: () => void
     ondelete?: () => void
+    ondownload?: () => void
     selected?: boolean
     selecting?: boolean
   } = $props()
@@ -95,6 +97,21 @@
         <path
           d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"
         />
+      </svg>
+    </button>
+  {/if}
+  {#if ondownload}
+    <button
+      class="btn-icon download"
+      title="下载到本机"
+      aria-label="下载到本机"
+      onclick={e => {
+        e.stopPropagation()
+        ondownload()
+      }}
+    >
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
       </svg>
     </button>
   {/if}
@@ -224,24 +241,36 @@
     font-weight: 600;
   }
 
-  .delete {
+  .delete,
+  .download {
     position: absolute;
     top: 8px;
-    right: 8px;
     width: 32px;
     height: 32px;
     opacity: 0;
     transition: opacity 0.15s;
   }
 
+  /* 下载按钮排在删除左侧 */
+  .delete {
+    right: 8px;
+  }
+
+  .download {
+    right: 44px;
+  }
+
   .card:hover .delete,
-  .card:focus-within .delete {
+  .card:hover .download,
+  .card:focus-within .delete,
+  .card:focus-within .download {
     opacity: 1;
   }
 
-  /* 触屏设备无 hover，删除按钮常显（半透明弱化，不喧宾夺主） */
+  /* 触屏设备无 hover，按钮常显（半透明弱化，不喧宾夺主） */
   @media (hover: none) {
-    .delete {
+    .delete,
+    .download {
       opacity: 0.55;
     }
   }

@@ -1540,6 +1540,30 @@ public partial class LocalBookService
          .Replace("\"", "&quot;").Replace("'", "&apos;");
 
     /// <summary>
+    /// 打开书籍原始文件的只读流（供 /downloadBook 下载整本），与上传对偶。
+    /// 仅接受 books/ 内的 .txt/.epub；路径穿越由 ResolveLocalPath 拦截。
+    /// 返回 (文件流, 原始文件名)；非法路径或文件不存在返回 null。
+    /// </summary>
+    public (FileStream Stream, string FileName)? OpenBookFile(string url)
+    {
+        var filePath = ResolveLocalPath(url);
+        if (filePath == null || !File.Exists(filePath)) return null;
+
+        var ext = Path.GetExtension(filePath);
+        if (!ext.Equals(".txt", StringComparison.OrdinalIgnoreCase) &&
+            !ext.Equals(".epub", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var stream = new FileStream(
+            filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: TxtByteChunk,
+            options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return (stream, Path.GetFileName(filePath));
+    }
+
+    /// <summary>
     /// 「删除」本地书籍：不硬删，移入 books/.trash/ 回收站（同名时加序号），
     /// 用户可手动恢复。前端在「搜索书拒绝入库」流程也会调 deleteBook，
     /// 硬删会让一次误点直接毁掉书籍文件。返回是否实际移动了文件。

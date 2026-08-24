@@ -220,6 +220,22 @@
     }
   }
 
+  // 下载原始文件到本机；成功后浏览器自带下载提示，这里只兜底报错。
+  const downloadToFile = async (book: Book) => {
+    toast(`正在获取《${book.name}》…`)
+    try {
+      await api.downloadBook(book.bookUrl)
+    } catch {
+      toast('下载失败，请检查网络与后端状态', 'error')
+    }
+  }
+
+  // 仅本地书籍可下载（在线搜索结果没有对应的服务端文件）
+  const downloadHandler = (book: Book | SearchBook) =>
+    searching || selectionMode || !book.bookUrl.startsWith('local://')
+      ? undefined
+      : () => downloadToFile(book as Book)
+
   const pickAndUpload = () => {
     const input = document.createElement('input')
     input.type = 'file'
@@ -394,6 +410,7 @@
               ondelete={searching || selectionMode
                 ? undefined
                 : () => removeBook(book as Book)}
+              ondownload={downloadHandler(book)}
             />
           {:else}
             <BookCard
@@ -405,6 +422,7 @@
               ondelete={searching || selectionMode
                 ? undefined
                 : () => removeBook(book as Book)}
+              ondownload={downloadHandler(book)}
             />
           {/if}
         {/each}

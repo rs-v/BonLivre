@@ -320,6 +320,42 @@ public static class BookshelfEndpoints
             }
         });
 
+        // 下载书籍原始文件：与上传对偶。bookUrl 走 body 不进 URL；文件名随
+        // Content-Disposition 下发（非 ASCII 由框架按 RFC 5987 写成 filename*）。
+        // 错误用状态码表达，与 /cover、/image 一致——二进制端点不包 LeagdoApiResponse。
+        app.MapPost("/downloadBook", async (HttpRequest request) =>
+        {
+            DownloadBookRequest? downloadRequest;
+            try
+            {
+                downloadRequest = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    AppJsonSerializerContext.Default.DownloadBookRequest,
+                    request.HttpContext.RequestAborted);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[downloadBook Error]: {ex.Message}");
+                return Results.BadRequest();
+            }
+
+            var url = downloadRequest?.Url ?? "";
+            if (!url.StartsWith("local://", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.BadRequest();
+            }
+
+            var file = localService.OpenBookFile(url);
+            if (file == null) return Results.NotFound();
+
+            // TXT 可能是 GB18030 等编码，不标 charset；反正按附件下载，前端存原始字节。
+            var contentType = file.Value.FileName.EndsWith(".epub", StringComparison.OrdinalIgnoreCase)
+                ? "application/epub+zip"
+                : "text/plain";
+            // Results.File 执行完毕会释放流；客户端中断时 Kestrel 负责清理。
+            return Results.File(file.Value.Stream, contentType, file.Value.FileName);
+        });
+
         // 搜索词是用户输入内容，同样只走 body。
         app.MapPost("/searchBookContent", async (HttpRequest request) =>
         {

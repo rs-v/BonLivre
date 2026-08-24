@@ -65,6 +65,8 @@ public record CoverRequest(string Path);
 
 public record EpubImageRequest(string Url, string Path);
 
+public record DownloadBookRequest(string Url);
+
 public record BookChapter(
     string Title,
     string Url,

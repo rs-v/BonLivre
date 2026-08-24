@@ -135,6 +135,57 @@ export const uploadBook = async (files: File[], overwrite = false) => {
   })
 }
 
+/**
+ * 下载整本原始文件（.txt/.epub）：凭证与 bookUrl 都不进 URL，
+ * fetch 拿到 blob 后用一次性 <a download> 交给浏览器存盘。
+ */
+export const downloadBook = async (bookUrl: string): Promise<void> => {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  const password = getPassword()
+  if (password) headers.set('Authorization', `Bearer ${password}`)
+
+  const resp = await fetch(`${baseUrl}/downloadBook`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ url: bookUrl }),
+  })
+  if (resp.status === 401) throw new ApiError('密码错误或缺失', 401)
+  if (!resp.ok) throw new ApiError(`请求失败（${resp.status}）`, resp.status)
+
+  const blob = await resp.blob()
+  saveBlob(downloadFileName(resp.headers.get('Content-Disposition'), bookUrl), blob)
+}
+
+/** 从 Content-Disposition 解析文件名：RFC 5987 的 filename* 优先，回退 filename，再回退 bookUrl 里的原名。 */
+const downloadFileName = (disposition: string | null, bookUrl: string): string => {
+  if (disposition) {
+    const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(disposition)?.[1]
+    if (star) {
+      try {
+        return decodeURIComponent(star.trim())
+      } catch {
+        /* 百分号序列非法时走 filename 回退 */
+      }
+    }
+    const plain = /filename\s*=\s*(?:"([^"]*)"|([^;\s]+))/i.exec(disposition)
+    const name = (plain?.[1] ?? plain?.[2] ?? '').trim()
+    if (name) return name
+  }
+  return bookUrl.replace(/^local:\/\//, '').split('#')[0] || 'book'
+}
+
+/** 生成临时 object URL 触发保存；延迟回收，给浏览器下载留出取引用的时间。 */
+const saveBlob = (fileName: string, blob: Blob) => {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url))
+}
+
 // ---------- 书签、进度与配置 ----------
 
 export const getBookmarks = (bookUrl: string) =>
