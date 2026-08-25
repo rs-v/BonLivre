@@ -119,19 +119,24 @@ internal static partial class TxtChapterSplitter
     /// 若不在这里去掉，后面的「空章合并」会反过来删掉真标题、留下那行小编号。
     ///
     /// 两个都是强族时不去重——卷标题后面紧跟本卷第一章、楔子后面紧跟第一章，
-    /// 都是正常排版，两条都得留下。
+    /// 都是正常排版，两条都得留下。唯一的例外是元信息短词（正文/后记/尾声…）：
+    /// 「章标题下一行裸『正文』标记行」是常见排版，若把它当章节保留，
+    /// 它会把真标题的正文切成零长碎片，空章合并便反过来删光全部真标题。
     /// </summary>
     private static List<Candidate> Dedupe(List<Candidate> sorted)
     {
         var kept = new List<Candidate>(sorted.Count);
         foreach (var c in sorted)
         {
-            if (kept.Count > 0 &&
-                c.LineStart - kept[^1].LineStart < MinHeadingDistance &&
-                !(IsStrong(c.Family) && IsStrong(kept[^1].Family)))
+            if (kept.Count > 0 && c.LineStart - kept[^1].LineStart < MinHeadingDistance)
             {
-                if (Strength(c.Family) > Strength(kept[^1].Family)) kept[^1] = c;
-                continue;
+                // 与上一条候选之间连一行正文都放不下：这个元信息词只是标记行。
+                if (c.Family == Family.Word) continue;
+                if (!(IsStrong(c.Family) && IsStrong(kept[^1].Family)))
+                {
+                    if (Strength(c.Family) > Strength(kept[^1].Family)) kept[^1] = c;
+                    continue;
+                }
             }
             kept.Add(c);
         }
