@@ -374,21 +374,58 @@ internal static partial class TxtChapterSplitter
 
         // 空章合并：非卷空区间删除，避免目录里出现点进去只有标题的项。
         // 卷标题空区间保留（前端按 IsVolume 折叠/样式区分，seekMap 会跳过 length<=0 的章节）。
+        //
+        // 「空」按连续空区间的整段判定，而非逐区间判定：误判候选（正文里恰好以
+        // 第N章开头的短句）贴着下一章标题时，会把真章节的收尾切成两个「各自只有
+        // 标题行」的碎片，逐区间判空会连真标题一起删——与 db5ed7e 修掉的裸标记行
+        // 是同一类结局，只是这里的碎片来自强族候选。把整段并起来看：首个标题行
+        // 之后还有可见正文，就保留段首标题、吞掉段内其余碎片；整段确实只有标题
+        // （如紧贴下一章的裸「楔子」行、以 第N章 开头的一句正文）才整段删掉，
+        // 这一条同时是「一句话开头的正文不会变成幻影章节」的防线。
         for (var i = 0; i < spans.Count;)
         {
-            if (!spans[i].IsVolume && spans[i].ContentLength == 0) spans.RemoveAt(i);
-            else i++;
+            if (spans[i].IsVolume || spans[i].ContentLength != 0) { i++; continue; }
+
+            var j = i + 1;
+            while (j < spans.Count && !spans[j].IsVolume && spans[j].ContentLength == 0) j++;
+
+            var runEnd = j < spans.Count ? spans[j].Start : content.Length;
+            var body = content.AsSpan((int)spans[i].Start, (int)(runEnd - spans[i].Start));
+            var firstNl = body.IndexOf('\n');
+            var afterFirstTitle = firstNl < 0 ? ReadOnlySpan<char>.Empty : body[(firstNl + 1)..];
+
+            if (ReaderTextMetrics.CalculateContentLength(afterFirstTitle) > 0)
+            {
+                // 段内混有真正文：保留段首标题、吸收其余碎片，ContentLength 按合并后区间重算。
+                spans[i] = spans[i] with
+                {
+                    Length = runEnd - spans[i].Start,
+                    ContentLength = ReaderTextMetrics.CalculateContentLength(body),
+                };
+                for (var k = i + 1; k < j; k++) spans.RemoveAt(i + 1);
+                i++;
+            }
+            else
+            {
+                for (var k = i; k < j; k++) spans.RemoveAt(i);
+            }
         }
 
         if (spans.Count == 0) return [WholeBook(content)];
 
         // 删空章后区间不再首尾相接，这里补回「覆盖全文 + 互不重叠」的不变量：
         // 每一章延伸到下一章的起点，首章从 0 开始。调用方的 char→byte 重放依赖这一点。
+        // 几何变化的区间里，被吞进的标题行也是要渲染出来的正文，ContentLength 必须随之
+        // 重算，否则 seekMap 与章内进度条分母偏小，进度永远差最后一小截。
         for (var i = 0; i < spans.Count; i++)
         {
             var start = i == 0 ? 0 : spans[i].Start;
             var end = i + 1 < spans.Count ? spans[i + 1].Start : content.Length;
-            spans[i] = spans[i] with { Start = start, Length = end - start };
+            var length = end - start;
+            var contentLength = start == spans[i].Start && length == spans[i].Length
+                ? spans[i].ContentLength
+                : ReaderTextMetrics.CalculateContentLength(content.AsSpan((int)start, (int)length));
+            spans[i] = spans[i] with { Start = start, Length = length, ContentLength = contentLength };
         }
         return spans;
     }
