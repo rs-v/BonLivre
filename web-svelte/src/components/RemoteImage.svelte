@@ -24,7 +24,7 @@
     class?: string
   } = $props()
 
-  let host = $state<HTMLSpanElement | null>(null)
+  let target = $state<HTMLElement | null>(null)
   let objectUrl = $state<string | null>(null)
   // 加载武装标记：必须是 $state——回收后复位它才能重新触发上方 effect（普通变量无响应性）
   let armed = $state(true)
@@ -32,7 +32,7 @@
 
   // 进入视口前 300px 开始加载
   $effect(() => {
-    if (!armed || src !== undefined || objectUrl !== null || !host || !loadBlob) return
+    if (!armed || src !== undefined || objectUrl !== null || !target || !loadBlob) return
     const io = new IntersectionObserver(
       entries => {
         if (entries.some(e => e.isIntersecting)) {
@@ -42,7 +42,7 @@
       },
       { rootMargin: '300px' },
     )
-    io.observe(host)
+    io.observe(target)
     return () => io.disconnect()
   })
 
@@ -61,7 +61,7 @@
 
   // 离开视口 1500px 后回收；进 300 / 出 1500 的迟滞防止边界抖动反复加载
   $effect(() => {
-    if (src !== undefined || objectUrl === null || !host) return
+    if (src !== undefined || objectUrl === null || !target) return
     const io = new IntersectionObserver(
       entries => {
         for (const entry of entries) {
@@ -70,7 +70,7 @@
       },
       { rootMargin: '1500px' },
     )
-    io.observe(host)
+    io.observe(target)
     return () => io.disconnect()
   })
 
@@ -88,19 +88,11 @@
   })
 </script>
 
-<span class="ri-host" bind:this={host}>
-  {#if src !== undefined}
-    <img class={className} {src} {alt} loading="lazy" />
-  {:else if objectUrl !== null}
-    <img class={className} src={objectUrl} {alt} loading="lazy" />
-  {:else}
-    <!-- 占位元素带上同名 class：加载前后尺寸一致，消费方背景色即占位底色 -->
-    <span class={className} aria-hidden="true"></span>
-  {/if}
-</span>
-
-<style>
-  .ri-host {
-    display: contents;
-  }
-</style>
+{#if src !== undefined}
+  <img class={className} {src} {alt} loading="lazy" />
+{:else if objectUrl !== null}
+  <img bind:this={target} class={className} src={objectUrl} {alt} loading="lazy" />
+{:else}
+  <!-- 占位元素带上同名 class：加载前后尺寸一致，消费方背景色即占位底色；它也是懒加载观察目标。 -->
+  <span bind:this={target} class={className} aria-hidden="true"></span>
+{/if}
