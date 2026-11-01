@@ -96,13 +96,13 @@
   // 书架按选定维度排序；在线搜索结果（SearchBook 无时间字段）保持后端返回顺序。
   const sortedShelf = $derived.by<Book[]>(() => {
     if (shelfSort === 'imported') {
-      return shelf.toSorted((a, b) => {
+      return [...shelf].sort((a, b) => {
         const diff = (b.importedAt ?? 0) - (a.importedAt ?? 0)
         if (diff !== 0) return diff
         return a.name.localeCompare(b.name, 'zh')
       })
     }
-    return shelf.toSorted((a, b) => b.durChapterTime - a.durChapterTime)
+    return [...shelf].sort((a, b) => b.durChapterTime - a.durChapterTime)
   })
 
   // 本地过滤：搜索词非空但未触发在线搜索时，按书名/作者过滤书架
